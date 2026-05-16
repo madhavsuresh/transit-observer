@@ -1,0 +1,10 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/*.duckdb
+data/*.duckdb.wal
+data/*.tmp
+logs/
+.DS_Store
