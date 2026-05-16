@@ -14,11 +14,18 @@ Reads from the read replica; doesn't write.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
 
 import duckdb
+
+from .journey.quantile_distribution import (
+    lognormal_quantile,
+    pit_value,
+    fit_lognormal_from_p50_p80,
+)
 
 
 @dataclass(frozen=True)
@@ -40,6 +47,36 @@ class CalibrationBin:
     predicted_upper: float
     n: int
     actual_failure_rate: float
+
+
+@dataclass(frozen=True)
+class ReliabilityPoint:
+    """One point on a reliability diagram (Job A in the viz plan).
+
+    The diagram plots ``empirical_coverage`` (y) against
+    ``nominal_quantile`` (x). A perfectly-calibrated kernel produces
+    points on the y=x diagonal.
+    """
+    line: str
+    nominal_quantile: float
+    empirical_coverage: float
+    n: int
+
+
+@dataclass(frozen=True)
+class PitBin:
+    """One bar of a PIT histogram.
+
+    Uniform-looking histograms ⇒ calibrated kernel.
+    U-shape ⇒ predictions too tight (under-dispersion).
+    ∩-shape ⇒ predictions too wide (over-dispersion).
+    Left-skew ⇒ actuals are systematically slower than predictions.
+    """
+    line: str
+    bin_lower: float
+    bin_upper: float
+    count: int
+    density: float        # count / (n_total * bin_width)
 
 
 def corridor_coverage(
@@ -105,6 +142,147 @@ def uncovered_buckets(
         [target_samples],
     ).fetchall()
     return [(line, direction or "?", hod, bool(weekday), n) for line, direction, hod, weekday, n in rows]
+
+
+_DEFAULT_RELIABILITY_GRID: tuple[float, ...] = (
+    0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
+)
+
+
+def _resolved_forecasts_for_calibration(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    line: str | None,
+    min_truth_confidence: float,
+) -> list[tuple[str, float, float, float, float]]:
+    """Pull (line, p50, p80, p90, actual_total_seconds) for resolved rows.
+
+    Filters to ``status='resolved'`` and ``truth_confidence >= threshold``
+    so that headline calibration metrics only count cleanly-bracketed
+    outcomes (matches the corpus_summary policy).
+    """
+    sql = """
+        SELECT q.line,
+               q.predicted_total_p50,
+               q.predicted_total_p80,
+               q.predicted_total_p90,
+               o.actual_total_seconds
+          FROM forecast_outcomes o
+          JOIN forecast_queue q USING (forecast_id)
+         WHERE q.status = 'resolved'
+           AND COALESCE(o.truth_confidence, 0) >= ?
+           AND q.predicted_total_p50 > 0
+           AND q.predicted_total_p80 > q.predicted_total_p50
+           AND o.actual_total_seconds IS NOT NULL
+    """
+    params: list = [min_truth_confidence]
+    if line is not None:
+        sql += " AND q.line = ?"
+        params.append(line)
+    return conn.execute(sql, params).fetchall()
+
+
+def reliability_curve(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    line: str | None = None,
+    quantile_grid: tuple[float, ...] = _DEFAULT_RELIABILITY_GRID,
+    min_truth_confidence: float = 0.5,
+    min_samples: int = 30,
+) -> list[ReliabilityPoint]:
+    """For each (line, q), empirical fraction with actual ≤ fitted q-quantile.
+
+    Fits a log-normal to each forecast's (p50, p80) and asks "did the
+    actual outcome fall below the q-th percentile of that fit?" — then
+    averages those indicators per (line, q). Perfect calibration plots
+    on the y=x diagonal.
+
+    Lines with fewer than ``min_samples`` resolved forecasts are
+    omitted; their reliability curve would be too noisy to read.
+    """
+    rows = _resolved_forecasts_for_calibration(
+        conn, line=line, min_truth_confidence=min_truth_confidence,
+    )
+    by_line: dict[str, list[tuple[float, float, float, float]]] = {}
+    for ln, p50, p80, p90, actual in rows:
+        by_line.setdefault(ln, []).append((p50, p80, p90, actual))
+
+    out: list[ReliabilityPoint] = []
+    for ln, items in by_line.items():
+        if len(items) < min_samples:
+            continue
+        for q in quantile_grid:
+            hits = 0
+            n = 0
+            for p50, p80, _p90, actual in items:
+                try:
+                    mu, sigma = fit_lognormal_from_p50_p80(p50, p80)
+                except ValueError:
+                    continue
+                threshold = lognormal_quantile(q, mu, sigma)
+                if actual <= threshold:
+                    hits += 1
+                n += 1
+            if n == 0:
+                continue
+            out.append(ReliabilityPoint(
+                line=ln,
+                nominal_quantile=q,
+                empirical_coverage=hits / n,
+                n=n,
+            ))
+    out.sort(key=lambda p: (p.line, p.nominal_quantile))
+    return out
+
+
+def pit_histogram(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    line: str | None = None,
+    n_bins: int = 20,
+    min_truth_confidence: float = 0.5,
+    min_samples: int = 30,
+) -> list[PitBin]:
+    """Binned PIT values per line.
+
+    Probability Integral Transform: PIT_i = F_predicted(actual_i). If
+    the kernel is calibrated, the PIT values are uniformly distributed
+    on [0, 1]. Deviations diagnose the kind of miscalibration (see the
+    PitBin docstring).
+    """
+    rows = _resolved_forecasts_for_calibration(
+        conn, line=line, min_truth_confidence=min_truth_confidence,
+    )
+    by_line: dict[str, list[float]] = {}
+    for ln, p50, p80, _p90, actual in rows:
+        pit = pit_value(actual, p50, p80)
+        if not math.isfinite(pit):
+            continue
+        by_line.setdefault(ln, []).append(pit)
+
+    bin_width = 1.0 / n_bins
+    out: list[PitBin] = []
+    for ln, pits in by_line.items():
+        if len(pits) < min_samples:
+            continue
+        counts = [0] * n_bins
+        for pit in pits:
+            idx = min(int(pit / bin_width), n_bins - 1)
+            counts[idx] += 1
+        total = sum(counts)
+        for i in range(n_bins):
+            lower = i * bin_width
+            upper = lower + bin_width
+            density = counts[i] / total / bin_width if total else 0.0
+            out.append(PitBin(
+                line=ln,
+                bin_lower=lower,
+                bin_upper=upper,
+                count=counts[i],
+                density=density,
+            ))
+    out.sort(key=lambda b: (b.line, b.bin_lower))
+    return out
 
 
 def calibration_bins(

@@ -15,8 +15,23 @@ import streamlit as st
 
 from transit_observer import db
 from transit_observer.config import CHICAGO, settings
+from transit_observer.corpus import predict_for_od
+from transit_observer.corridors import SEED_CORRIDORS
 from transit_observer.direction_audit import audit_summary
-from transit_observer.metrics import corpus_summary, corridor_coverage, status
+from transit_observer.metrics import (
+    corpus_summary,
+    corridor_coverage,
+    pit_histogram,
+    reliability_curve,
+    status,
+)
+from transit_observer.viz import (
+    coverage_heatmap_chart,
+    pit_histogram_chart,
+    quantile_dotplot_chart,
+    reliability_diagram_chart,
+    sharpness_coverage_chart,
+)
 
 
 st.set_page_config(page_title="transit-observer", layout="wide")
@@ -147,6 +162,114 @@ def _residual_df(window_hours: int) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=30)
+def _reliability_df(min_samples: int) -> pd.DataFrame:
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        rows = reliability_curve(conn, min_samples=min_samples)
+    return pd.DataFrame(
+        [
+            {
+                "line": r.line,
+                "nominal_quantile": r.nominal_quantile,
+                "empirical_coverage": r.empirical_coverage,
+                "n": r.n,
+            }
+            for r in rows
+        ]
+    )
+
+
+@st.cache_data(ttl=30)
+def _pit_df(min_samples: int, n_bins: int) -> pd.DataFrame:
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        rows = pit_histogram(conn, n_bins=n_bins, min_samples=min_samples)
+    return pd.DataFrame(
+        [
+            {
+                "line": r.line,
+                "bin_lower": r.bin_lower,
+                "bin_upper": r.bin_upper,
+                "count": r.count,
+                "density": r.density,
+            }
+            for r in rows
+        ]
+    )
+
+
+def _render_live_forecast_tab() -> None:
+    """Interactive: pick a seeded corridor, run the predictor, dotplot it."""
+    options = {
+        f"{c.mode} · {c.line} · {c.origin_label} → {c.destination_label}": c
+        for c in SEED_CORRIDORS
+    }
+    if not options:
+        st.info("No seeded corridors available.")
+        return
+    label = st.selectbox("Corridor", list(options.keys()), key="live_forecast_corridor")
+    corridor = options[label]
+    if not st.button("Predict", key="live_forecast_predict"):
+        st.caption(
+            "Click Predict to run the live kernel against the read replica "
+            "and render a 50-dot quantile dotplot. Each dot ≈ 2% probability."
+        )
+        return
+
+    now = datetime.now(CHICAGO)
+    try:
+        with db.reader() as conn:
+            prediction = predict_for_od(
+                conn,
+                mode=corridor.mode, line=corridor.line,
+                boarding_int_id=corridor.boarding_int_id,
+                boarding_text_id=corridor.boarding_text_id,
+                alighting_int_id=corridor.alighting_int_id,
+                alighting_text_id=corridor.alighting_text_id,
+                now=now,
+            )
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Predictor failed: {type(exc).__name__}: {exc}")
+        return
+
+    if prediction is None:
+        st.warning(
+            "No prediction available right now — the per-mode predictor "
+            "lacked recent data (e.g. no upcoming arrivals at the boarding stop)."
+        )
+        return
+
+    p50 = prediction.predicted_total_p50
+    p80 = prediction.predicted_total_p80
+    p90 = prediction.predicted_total_p90
+    if not (p50 > 0 and p80 > p50):
+        st.warning(
+            f"Predictor returned a degenerate quantile triple "
+            f"(p50={p50:.0f}s, p80={p80:.0f}s) — cannot fit a distribution."
+        )
+        return
+
+    cols = st.columns(3)
+    cols[0].metric("p50 (minutes)", f"{p50 / 60:.1f}")
+    cols[1].metric("p80 (minutes)", f"{p80 / 60:.1f}")
+    cols[2].metric("p90 (minutes)", f"{p90 / 60:.1f}")
+    st.altair_chart(
+        quantile_dotplot_chart(
+            p50, p80,
+            title=f"{corridor.line}: {corridor.origin_label} → {corridor.destination_label}",
+        ),
+        use_container_width=True,
+    )
+    st.caption(
+        "Fitted log-normal to (p50, p80). Each dot is one of 50 evenly-spaced "
+        "quantiles ⇒ ≈ 2% probability mass per dot. Count dots ≤ a target "
+        "duration to read off Pr(arrival within that time)."
+    )
+
+
 def _render() -> None:
     st.title("transit-observer")
     st.caption("Long-running validator for the Cozy Fox journey kernels.")
@@ -185,6 +308,77 @@ def _render() -> None:
             .properties(height=300)
         )
         st.altair_chart(chart, use_container_width=True)
+
+    st.divider()
+    st.subheader("Calibration & forecast displays")
+    st.caption(
+        "Diagnostic views recommended by the transit-uncertainty literature "
+        "(Kay et al., CHI 2016 / 2018) and standard forecast-verification "
+        "practice. PIT and reliability assume a log-normal fit through "
+        "(p50, p80); see the project README for the rationale."
+    )
+    tabs = st.tabs([
+        "Reliability",
+        "PIT shape",
+        "Coverage map",
+        "Sharpness ↔ coverage",
+        "Live forecast",
+    ])
+    with tabs[0]:
+        reliability = _reliability_df(min_samples=max(min_samples, 30))
+        if reliability.empty:
+            st.info(
+                "Need ≥30 resolved forecasts per line to draw a stable "
+                "reliability curve. Keep the collector running."
+            )
+        else:
+            st.altair_chart(
+                reliability_diagram_chart(reliability),
+                use_container_width=True,
+            )
+            st.caption(
+                "Each point: at the nominal quantile q (x), the fraction of "
+                "actuals that fell below the fitted q-quantile (y). Dashed "
+                "y=x line is perfect calibration. Above ⇒ predictions too "
+                "pessimistic; below ⇒ too optimistic."
+            )
+    with tabs[1]:
+        pit = _pit_df(min_samples=max(min_samples, 30), n_bins=20)
+        if pit.empty:
+            st.info("Need ≥30 resolved forecasts per line to draw a PIT histogram.")
+        else:
+            st.altair_chart(pit_histogram_chart(pit), use_container_width=True)
+            st.caption(
+                "Histogram of PIT = F_predicted(actual). "
+                "Flat ⇒ calibrated. U-shape ⇒ intervals too tight. "
+                "∩-shape ⇒ too wide. Left-skew ⇒ actuals slower than predicted. "
+                "Right-skew ⇒ actuals faster than predicted."
+            )
+    with tabs[2]:
+        if coverage.empty:
+            st.info("No buckets with the current sample threshold.")
+        else:
+            st.altair_chart(coverage_heatmap_chart(coverage), use_container_width=True)
+            st.caption(
+                "p80 coverage minus target (0.80). Red ⇒ overconfident "
+                "(intervals too tight); blue ⇒ underconfident (intervals too "
+                "wide); white ⇒ on target."
+            )
+    with tabs[3]:
+        if coverage.empty:
+            st.info("No buckets with the current sample threshold.")
+        else:
+            st.altair_chart(
+                sharpness_coverage_chart(coverage),
+                use_container_width=True,
+            )
+            st.caption(
+                "Lower-right is the worst quadrant: confident *and* wrong. "
+                "Aim for points clustered near the dashed line at y=0.8 with "
+                "low sharpness (tight intervals)."
+            )
+    with tabs[4]:
+        _render_live_forecast_tab()
 
     st.divider()
     st.subheader("Corpus corridors")
