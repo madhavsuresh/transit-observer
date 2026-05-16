@@ -44,6 +44,17 @@ class Settings:
     promotion_interval_seconds: float = 600.0     # how often to scan for popular ODs to auto-upgrade
     promotion_min_count: int = 50                 # queries-in-7-days threshold for auto-upgrade
 
+    # Learned predictor: how often to retry the GBM fit. The first
+    # firing happens one interval after collector startup. The fit
+    # itself refuses to run until the cold-start thresholds are met
+    # (see training.dataset.cold_start_threshold), so this is safe to
+    # tick frequently early on.
+    train_interval_seconds: float = 43200.0       # 12 h — nightly-ish
+    train_window_days: int = 60
+    # Set to 0 to disable in-collector training (e.g., when running a
+    # separate cron-driven trainer).
+    train_enabled: bool = True
+
     line_codes: tuple[str, ...] = field(
         default_factory=lambda: ("red", "blue", "brn", "g", "org", "p", "pink", "y")
     )

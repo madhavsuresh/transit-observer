@@ -71,6 +71,7 @@ async def run(stngs: Settings = settings) -> None:
     last_intercampus_poll = datetime.now(CHICAGO)
     last_query_import = datetime.now(CHICAGO)
     last_promotion = datetime.now(CHICAGO)
+    last_train_attempt = datetime.now(CHICAGO)
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -162,6 +163,13 @@ async def run(stngs: Settings = settings) -> None:
                     if promoted:
                         log.info("corridors.promoted", n=len(promoted), ids=promoted)
                     last_promotion = tick_started
+
+                if (
+                    stngs.train_enabled
+                    and (tick_started - last_train_attempt).total_seconds() >= stngs.train_interval_seconds
+                ):
+                    _maybe_train(conn, now=tick_started, window_days=stngs.train_window_days)
+                    last_train_attempt = tick_started
 
                 if (tick_started - last_replica_refresh).total_seconds() >= stngs.read_replica_refresh_seconds:
                     db.refresh_read_replica()
@@ -397,6 +405,64 @@ def _generate_corridor_predictions(
         if result is not None:
             n += 1
     return n
+
+
+def _maybe_train(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    now: datetime,
+    window_days: int,
+) -> None:
+    """Try fitting the learned GBM in-process.
+
+    Single-writer-safe: runs on the collector's writable connection so
+    artifacts are registered without contending for the DB lock.
+    No-ops cleanly when:
+      - the cold-start gate isn't met (not enough resolved outcomes)
+      - the ``learned`` dependency group isn't installed (LightGBM
+        ImportError is caught and logged)
+      - the training frame is empty after horizon filtering
+    """
+    try:
+        from .training import dataset, fit
+    except ImportError as exc:
+        log.info("train.skip", reason="learned_deps_missing", err=str(exc))
+        return
+
+    ready, diag = dataset.cold_start_threshold(conn)
+    if not ready:
+        log.info(
+            "train.skip",
+            reason="cold_start",
+            total_resolved=diag["total_resolved"],
+            global_threshold=diag["global_threshold"],
+            n_strong_buckets=diag["n_strong_buckets"],
+        )
+        return
+
+    since = now - timedelta(days=window_days)
+    frame = dataset.build_training_frame_l(conn, since=since, until=now)
+    if len(frame) < 500:
+        log.info("train.skip", reason="too_few_rows", n=len(frame))
+        return
+
+    try:
+        report = fit.fit_quantile_gbm(conn, frame, now=now)
+    except ImportError as exc:
+        log.info("train.skip", reason="learned_deps_missing", err=str(exc))
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.warning("train.error", err=str(exc))
+        return
+
+    warm = fit.warmup_dtaci(conn, n_warmup_rows=500)
+    log.info(
+        "train.fit",
+        boosters=len(report.boosters),
+        rows_train=report.rows_train,
+        rows_val=report.rows_val,
+        dtaci_updates=warm["n_warmup_updates"],
+    )
 
 
 def main() -> None:

@@ -290,6 +290,69 @@ CREATE TABLE IF NOT EXISTS forecast_outcomes (
     failed                   BOOLEAN,
     notes                    TEXT
 );
+
+-- DtACI / EB-shrinkage online state. One row per (predictor_version, line,
+-- direction_code, leg, quantile). The resolver updates `offset_seconds`
+-- after each scored outcome so the live predictor can adjust its raw
+-- quantile output toward the empirical target coverage.
+CREATE TABLE IF NOT EXISTS predictor_state (
+    predictor_version  TEXT NOT NULL,
+    line               TEXT NOT NULL,
+    direction_code     TEXT NOT NULL,
+    leg                TEXT NOT NULL,           -- 'wait' | 'in_vehicle' | 'total' | 'residual'
+    quantile           DOUBLE NOT NULL,         -- 0.5 | 0.8 | 0.9 | -1 for mean-shift
+    offset_seconds     DOUBLE NOT NULL DEFAULT 0.0,
+    step_size          DOUBLE NOT NULL DEFAULT 0.01,
+    coverage_target    DOUBLE NOT NULL DEFAULT 0.8,
+    coverage_observed  DOUBLE,
+    n_observations     BIGINT  NOT NULL DEFAULT 0,
+    residual_mean      DOUBLE,                  -- running mean of residuals (for EB)
+    residual_var       DOUBLE,                  -- running variance of residuals
+    updated_at         TIMESTAMPTZ,
+    PRIMARY KEY (predictor_version, line, direction_code, leg, quantile)
+);
+
+-- Which predictor is "active" for a given corridor. Empty for corridors
+-- still on the bootstrap kernel. Filled by the registry's promote() with
+-- anti-flap switch-margin logic.
+CREATE TABLE IF NOT EXISTS predictor_active (
+    corridor_id        TEXT PRIMARY KEY,
+    predictor_version  TEXT NOT NULL,
+    decided_at         TIMESTAMPTZ NOT NULL,
+    decided_score      DOUBLE,                  -- CRPS + alpha*coverage_gap at decision
+    incumbent_score    DOUBLE,                  -- score of the predictor it displaced
+    margin             DOUBLE,                  -- decided_score - incumbent_score (negative = improvement)
+    n_consecutive_wins INTEGER NOT NULL DEFAULT 1,
+    pending_candidate  TEXT,                    -- challenger currently winning, not yet promoted
+    pending_wins       INTEGER NOT NULL DEFAULT 0,
+    pending_score      DOUBLE
+);
+
+-- Trained model artifacts on disk. Multiple rows per predictor_version
+-- (one per leg x line). Only the trainer writes here.
+CREATE TABLE IF NOT EXISTS model_artifacts (
+    predictor_version  TEXT NOT NULL,
+    leg                TEXT NOT NULL,           -- 'wait' | 'in_vehicle' | 'total'
+    line               TEXT NOT NULL,           -- 'ALL' = global model, else line code
+    quantile           DOUBLE NOT NULL,
+    artifact_path      TEXT NOT NULL,
+    trained_at         TIMESTAMPTZ NOT NULL,
+    n_train_rows       BIGINT,
+    n_val_rows         BIGINT,
+    val_pinball_loss   DOUBLE,
+    val_crps           DOUBLE,
+    feature_columns    TEXT,                    -- JSON list, for schema-drift detection
+    PRIMARY KEY (predictor_version, leg, line, quantile)
+);
+
+CREATE INDEX IF NOT EXISTS idx_predictor_state_v
+    ON predictor_state(predictor_version, line, direction_code);
+CREATE INDEX IF NOT EXISTS idx_arrivals_run_polled
+    ON train_arrivals_raw(line, run_number, polled_at);
+CREATE INDEX IF NOT EXISTS idx_positions_run_polled
+    ON train_positions_raw(line, run_number, polled_at);
+CREATE INDEX IF NOT EXISTS idx_outcomes_predictor
+    ON forecast_queue(predictor_version, line, direction_code, leave_at);
 """
 
 

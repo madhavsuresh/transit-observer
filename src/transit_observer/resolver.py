@@ -23,6 +23,12 @@ from .bus_predictor import resolve_bus_forecast
 from .direction_audit import audit_resolved_forecast
 from .intercampus_predictor import resolve_intercampus_forecast
 from .metra_predictor import resolve_metra_forecast
+from .predictors import conformal
+from .predictors.journey_kernel import (
+    KERNEL_EB_VERSION,
+    update_eb_state,
+)
+from .predictors.quantile_gbm import GBM_VERSION
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +48,10 @@ class _Forecast:
     predicted_total_p80: float
     predicted_total_p90: float
     resolve_after: datetime
+    predicted_wait_p50: float | None = None
+    predicted_wait_p80: float | None = None
+    predicted_wait_p90: float | None = None
+    predictor_version: str | None = None
 
 
 def resolve_due_forecasts(
@@ -60,7 +70,9 @@ def resolve_due_forecasts(
                boarding_map_id, boarding_text_id,
                alighting_map_id, alighting_text_id,
                predicted_total_p50, predicted_total_p80, predicted_total_p90,
-               resolve_after
+               resolve_after,
+               predicted_wait_p50, predicted_wait_p80, predicted_wait_p90,
+               predictor_version
           FROM forecast_queue
          WHERE status = 'pending'
            AND resolve_after <= ?
@@ -130,6 +142,13 @@ def resolve_due_forecasts(
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("direction_audit.error", forecast_id=forecast.forecast_id, err=str(exc))
+        try:
+            _update_predictor_state(conn, forecast, outcome, now=now)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "predictor_state.error",
+                forecast_id=forecast.forecast_id, err=str(exc),
+            )
         n_resolved += 1
 
     return n_resolved, n_unresolvable
@@ -286,6 +305,68 @@ def _endpoint_signal(
         return float((n[0] if n else 0) or 0)
 
     return None
+
+
+def _update_predictor_state(
+    conn: duckdb.DuckDBPyConnection,
+    f: _Forecast,
+    outcome: dict,
+    *,
+    now: datetime,
+) -> None:
+    """After scoring an outcome, update the EB / DtACI state for the
+    relevant predictor. No-op for predictor versions we don't manage
+    online state for (e.g. the parity-pure kernel-v1)."""
+    if f.predictor_version is None or f.mode != "L":
+        return
+    actual_wait = outcome.get("actual_wait_seconds")
+    if actual_wait is None:
+        return
+    line = f.line or ""
+    direction = f.direction_code or ""
+    if f.predictor_version == KERNEL_EB_VERSION and f.predicted_wait_p50 is not None:
+        residual = float(actual_wait) - float(f.predicted_wait_p50)
+        update_eb_state(
+            conn,
+            line=line, direction_code=direction,
+            residual_seconds=residual, now=now,
+        )
+    if f.predictor_version == GBM_VERSION or f.predictor_version.startswith("gbm-"):
+        # Update DtACI offsets for whichever quantiles the schema stores.
+        for quantile, raw in (
+            (0.8, f.predicted_wait_p80),
+            (0.9, f.predicted_wait_p90),
+        ):
+            if raw is None:
+                continue
+            conformal.update(
+                conn,
+                predictor_version=f.predictor_version,
+                line=line, direction_code=direction,
+                leg="wait", quantile=quantile,
+                raw_quantile_seconds=float(raw),
+                observed_seconds=float(actual_wait),
+                now=now,
+            )
+        # Also DtACI on the total leg using the predicted_total_p* fields
+        # (carried separately on the forecast row).
+        actual_total = outcome.get("actual_total_seconds")
+        if actual_total is not None:
+            for quantile, raw in (
+                (0.8, f.predicted_total_p80),
+                (0.9, f.predicted_total_p90),
+            ):
+                if raw is None:
+                    continue
+                conformal.update(
+                    conn,
+                    predictor_version=f.predictor_version,
+                    line=line, direction_code=direction,
+                    leg="total", quantile=quantile,
+                    raw_quantile_seconds=float(raw),
+                    observed_seconds=float(actual_total),
+                    now=now,
+                )
 
 
 def _resolve_l(conn: duckdb.DuckDBPyConnection, f: _Forecast, *, now: datetime) -> dict | None:
