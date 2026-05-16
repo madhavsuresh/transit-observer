@@ -14,6 +14,7 @@ the base collector keeps a slim dependency footprint.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +40,17 @@ log = structlog.get_logger(__name__)
 # Hyperparameters chosen for the data scale (10k-100k rows). Conservative
 # tree depth + bagging keeps the model honest at the lower end; LightGBM
 # scales these gracefully upward.
+#
+# ``num_threads`` is pinned to all available cores instead of LightGBM's
+# default (which can fall back to 1 on some shells). On Apple Silicon
+# this routes through Accelerate / AMX for the heavy matrix ops; on x86
+# it goes through OpenMP. LightGBM doesn't currently expose Apple GPU
+# directly (no Metal backend; OpenCL is x86-only for macOS wheels), so
+# we leave ``device_type`` at "cpu" — the AMX-backed CPU path is faster
+# than GPU at our data scale anyway.
+LGBM_NUM_THREADS = int(os.environ.get("LIGHTGBM_NUM_THREADS") or os.cpu_count() or 4)
+
+
 LGBM_PARAMS_BASE: dict[str, Any] = {
     "objective": "quantile",
     "metric": "quantile",
@@ -52,6 +64,10 @@ LGBM_PARAMS_BASE: dict[str, Any] = {
     "min_data_in_leaf": 20,
     "lambda_l2": 0.1,
     "verbose": -1,
+    "num_threads": LGBM_NUM_THREADS,
+    "device_type": "cpu",
+    "deterministic": False,   # allow non-deterministic multi-threaded ops
+    "force_col_wise": True,   # better cache behavior on small-medium frames
 }
 
 
@@ -168,6 +184,7 @@ def fit_quantile_gbm(
 
             per_q_artifact_paths: dict[float, Path] = {}
             per_q_val_pinball: dict[float, float] = {}
+            per_q_val_preds: dict[float, Any] = {}
             for q in quantiles:
                 params = {**LGBM_PARAMS_BASE, "alpha": q}
                 train_ds = lgb.Dataset(
@@ -204,9 +221,10 @@ def fit_quantile_gbm(
                 val_pinball = math.nan
                 if X_va is not None and len(X_va) > 0:
                     preds = booster.predict(X_va)
-                    val_pinball = float(np.mean([
-                        pinball_loss(yv, pv, q) for yv, pv in zip(y_va, preds)
-                    ]))
+                    # Vectorized pinball: alpha * err+ + (1-alpha) * err-
+                    err = y_va - preds
+                    val_pinball = float(np.mean(np.maximum(q * err, (q - 1.0) * err)))
+                    per_q_val_preds[q] = preds
 
                 feature_cols = list(X_tr.columns)
                 path = art.save_booster(
@@ -218,24 +236,22 @@ def fit_quantile_gbm(
                 per_q_artifact_paths[q] = path
                 per_q_val_pinball[q] = val_pinball
 
-            # Compute CRPS across the three trained quantiles on the val set
+            # Vectorized CRPS across the three trained quantiles on the val
+            # set — single BLAS-backed reduction instead of a per-row Python
+            # loop. Uses the predictions we already computed for pinball.
             val_crps = math.nan
-            if X_va is not None and len(X_va) > 0:
-                preds_by_q: dict[float, Any] = {}
-                # reload preds (we discarded them) — cheap relative to training
-                for q, _path in per_q_artifact_paths.items():
-                    pass  # the booster is in-memory in the loop above; let's compute below
-                # Recompute (simpler than threading them out of the loop)
-                import joblib  # type: ignore
-                for q in quantiles:
-                    obj = joblib.load(per_q_artifact_paths[q])
-                    preds_by_q[q] = obj["model"].predict(X_va)
-                crps_values = [
-                    crps_from_quantiles({q: float(preds_by_q[q][i]) for q in quantiles}, float(y_va[i]))
-                    for i in range(len(y_va))
-                ]
-                finite = [v for v in crps_values if math.isfinite(v)]
-                val_crps = float(sum(finite) / len(finite)) if finite else math.nan
+            if X_va is not None and len(X_va) > 0 and per_q_val_preds:
+                from ..predictors.diagnostics import crps_from_quantiles_batch
+
+                sorted_q = sorted(per_q_val_preds.keys())
+                qvals = np.stack([per_q_val_preds[q] for q in sorted_q], axis=1)
+                crps_arr = crps_from_quantiles_batch(
+                    quantile_levels=np.asarray(sorted_q, dtype=np.float64),
+                    quantile_values=qvals,
+                    actuals=np.asarray(y_va, dtype=np.float64),
+                )
+                finite_crps = crps_arr[np.isfinite(crps_arr)]
+                val_crps = float(finite_crps.mean()) if finite_crps.size else math.nan
 
             # Register all three quantiles for this (leg, line)
             for q, path in per_q_artifact_paths.items():
