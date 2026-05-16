@@ -268,11 +268,30 @@ def connect(path: Path | None = None, read_only: bool = False) -> duckdb.DuckDBP
 
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
+    """Bring an empty or pre-existing DB up to the current schema.
+
+    Order matters for the upgrade-in-place case: an existing
+    ``forecast_queue`` from PR #1 won't get new columns from
+    ``CREATE TABLE IF NOT EXISTS`` (it's a no-op), so we must
+    1) run CREATE TABLE first (creates missing tables fresh),
+    2) ALTER TABLE in any columns the old schema lacks, and
+    3) only then create indexes that reference the new columns.
+    """
+    tables: list[str] = []
+    indexes: list[str] = []
     for statement in SCHEMA_SQL.split(";"):
         body = statement.strip()
-        if body:
-            conn.execute(body)
+        if not body:
+            continue
+        if body.upper().startswith("CREATE INDEX"):
+            indexes.append(body)
+        else:
+            tables.append(body)
+    for stmt in tables:
+        conn.execute(stmt)
     _migrate(conn)
+    for stmt in indexes:
+        conn.execute(stmt)
 
 
 # Schema migrations for tables that may pre-date a newer column.
