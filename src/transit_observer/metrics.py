@@ -273,7 +273,8 @@ def corpus_summary(
           LEFT JOIN forecast_queue q ON q.corridor_id = c.corridor_id
           LEFT JOIN forecast_outcomes o ON o.forecast_id = q.forecast_id
          GROUP BY c.corridor_id, c.mode, c.line, c.direction,
-                  c.origin_label, c.destination_label, c.last_predicted_at
+                  c.origin_label, c.destination_label, c.last_predicted_at,
+                  c.priority
          ORDER BY c.priority ASC, c.corridor_id
         """,
         [threshold, threshold],

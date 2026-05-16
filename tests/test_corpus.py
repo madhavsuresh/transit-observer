@@ -12,6 +12,7 @@ import pytest
 from transit_observer import db
 from transit_observer.corpus import PREDICTOR_VERSION, predict_and_enqueue_corridor
 from transit_observer.corridors import SEED_CORRIDORS, by_id, seed_corridors
+from transit_observer.metrics import corpus_corridor_rows, corpus_summary
 
 
 T0 = datetime(2026, 1, 1, 8, 0, 0, tzinfo=timezone.utc)
@@ -140,6 +141,51 @@ def test_predict_and_enqueue_metra_corridor(conn: duckdb.DuckDBPyConnection):
     feature = json.loads(row[6])
     assert feature["mode"] == "metra"
     assert any(t["trip_id"] == "T-A" for t in feature["viable_trips"])
+
+
+def test_corpus_summary_runs_on_seeded_db(conn: duckdb.DuckDBPyConnection):
+    """Regression: ORDER BY c.priority needed priority in the GROUP BY for
+    DuckDB's strict aggregation rules. Should return one row per corridor
+    with n_predictions=0 even before any forecast lands."""
+    rows = corpus_summary(conn)
+    assert len(rows) == len(SEED_CORRIDORS)
+    assert all(r.n_predictions == 0 for r in rows)
+    assert all(r.coverage_p80 is None for r in rows)
+    # Sorted by (priority asc, corridor_id).
+    expected = sorted([(c.priority, c.corridor_id) for c in SEED_CORRIDORS])
+    actual = [(_lookup_priority(r.corridor_id), r.corridor_id) for r in rows]
+    assert actual == expected
+
+
+def _lookup_priority(corridor_id: str) -> int:
+    return by_id()[corridor_id].priority
+
+
+def test_corpus_summary_counts_predictions(conn: duckdb.DuckDBPyConnection):
+    corridor = by_id()["cta-red-belmont-lake-sb"]
+    _seed_l_arrivals(
+        conn, line=corridor.line, map_id=corridor.boarding_int_id,
+        leave_at=T0, departures_offset_s=[120, 600, 1200],
+    )
+    predict_and_enqueue_corridor(conn, corridor, now=T0)
+
+    rows = corpus_summary(conn)
+    by_cid = {r.corridor_id: r for r in rows}
+    assert by_cid[corridor.corridor_id].n_predictions == 1
+
+
+def test_corpus_corridor_rows_returns_recent_forecasts(conn: duckdb.DuckDBPyConnection):
+    corridor = by_id()["cta-red-belmont-lake-sb"]
+    _seed_l_arrivals(
+        conn, line=corridor.line, map_id=corridor.boarding_int_id,
+        leave_at=T0, departures_offset_s=[120, 600, 1200],
+    )
+    predict_and_enqueue_corridor(conn, corridor, now=T0)
+
+    rows = corpus_corridor_rows(conn, corridor_id=corridor.corridor_id)
+    assert len(rows) == 1
+    assert rows[0].predictor_version == PREDICTOR_VERSION
+    assert rows[0].status == "pending"
 
 
 def test_feature_json_records_time_features(conn: duckdb.DuckDBPyConnection):
