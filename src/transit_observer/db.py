@@ -79,6 +79,9 @@ CREATE TABLE IF NOT EXISTS forecast_queue (
     mode                     TEXT NOT NULL DEFAULT 'L',  -- L | bus | metra | intercampus
     line                     TEXT NOT NULL,              -- L line code / bus route / metra route_id / 'intercampus'
     direction_code           TEXT,
+    corridor_id              TEXT,                       -- FK to corridors.corridor_id (NULL for legacy rows)
+    predictor_version        TEXT,                       -- semver-ish hash for A/B between predictors
+    feature_json             TEXT,                       -- feature snapshot at prediction time (JSON)
     boarding_map_id          INTEGER NOT NULL DEFAULT 0, -- L only
     boarding_text_id         TEXT,                       -- non-L modes use this
     boarding_station_name    TEXT,
@@ -100,6 +103,32 @@ CREATE TABLE IF NOT EXISTS forecast_queue (
 );
 
 CREATE INDEX IF NOT EXISTS idx_forecast_status_resolve ON forecast_queue(status, resolve_after);
+CREATE INDEX IF NOT EXISTS idx_forecast_corridor ON forecast_queue(corridor_id);
+
+CREATE TABLE IF NOT EXISTS corridors (
+    corridor_id              TEXT PRIMARY KEY,
+    mode                     TEXT NOT NULL,
+    line                     TEXT NOT NULL,
+    direction                TEXT NOT NULL,
+    origin_label             TEXT NOT NULL,
+    origin_latitude          DOUBLE NOT NULL,
+    origin_longitude         DOUBLE NOT NULL,
+    destination_label        TEXT NOT NULL,
+    destination_latitude     DOUBLE NOT NULL,
+    destination_longitude    DOUBLE NOT NULL,
+    boarding_int_id          INTEGER NOT NULL DEFAULT 0,
+    boarding_text_id         TEXT,
+    alighting_int_id         INTEGER NOT NULL DEFAULT 0,
+    alighting_text_id        TEXT,
+    schedule_headway_seconds DOUBLE NOT NULL,
+    cadence_seconds          DOUBLE NOT NULL DEFAULT 300,
+    priority                 INTEGER NOT NULL DEFAULT 5,
+    is_active                BOOLEAN NOT NULL DEFAULT TRUE,
+    seeded_at                TIMESTAMPTZ NOT NULL,
+    last_predicted_at        TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_corridors_mode ON corridors(mode, is_active);
 
 CREATE TABLE IF NOT EXISTS metra_arrivals_raw (
     polled_at              TIMESTAMPTZ NOT NULL,
@@ -226,6 +255,7 @@ CREATE TABLE IF NOT EXISTS forecast_outcomes (
     in_p90_window            BOOLEAN,
     p50_residual_seconds     DOUBLE,
     p80_residual_seconds     DOUBLE,
+    truth_confidence         DOUBLE,        -- 0.0..1.0: how cleanly the snapshots bracket the boarded run
     failed                   BOOLEAN,
     notes                    TEXT
 );
@@ -242,6 +272,31 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         body = statement.strip()
         if body:
             conn.execute(body)
+    _migrate(conn)
+
+
+# Schema migrations for tables that may pre-date a newer column.
+# DuckDB doesn't have CREATE COLUMN IF NOT EXISTS, so we probe pragma_table_info
+# and skip when the column already exists. Cheap to run on every startup.
+_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("forecast_queue", "corridor_id",       "TEXT"),
+    ("forecast_queue", "predictor_version", "TEXT"),
+    ("forecast_queue", "feature_json",      "TEXT"),
+    ("forecast_outcomes", "truth_confidence", "DOUBLE"),
+)
+
+
+def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
+    for table, column, ctype in _MIGRATIONS:
+        existing = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM pragma_table_info(?)", [table]
+            ).fetchall()
+        }
+        if column in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}")
 
 
 def refresh_read_replica() -> None:

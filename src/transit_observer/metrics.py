@@ -155,6 +155,149 @@ class Status:
     overall_p80_coverage: float | None
 
 
+def _has_column(conn: duckdb.DuckDBPyConnection, *, table: str, column: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM pragma_table_info(?) WHERE name = ? LIMIT 1",
+        [table, column],
+    ).fetchone()
+    return bool(row)
+
+
+@dataclass(frozen=True)
+class CorpusRow:
+    forecast_id: str
+    leave_at: datetime
+    predictor_version: str | None
+    direction_code: str | None
+    predicted_total_p50: float
+    predicted_total_p80: float
+    predicted_total_p90: float
+    actual_total_seconds: float | None
+    in_p80_window: bool | None
+    p50_residual_seconds: float | None
+    truth_confidence: float | None
+    status: str
+
+
+def corpus_corridor_rows(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    corridor_id: str,
+    limit: int = 50,
+) -> list[CorpusRow]:
+    """Recent forecasts for one corridor, joined with outcomes if resolved."""
+    if not _has_column(conn, table="forecast_queue", column="corridor_id"):
+        return []
+    rows = conn.execute(
+        """
+        SELECT q.forecast_id, q.leave_at, q.predictor_version, q.direction_code,
+               q.predicted_total_p50, q.predicted_total_p80, q.predicted_total_p90,
+               o.actual_total_seconds, o.in_p80_window, o.p50_residual_seconds,
+               o.truth_confidence, q.status
+          FROM forecast_queue q
+          LEFT JOIN forecast_outcomes o USING (forecast_id)
+         WHERE q.corridor_id = ?
+         ORDER BY q.leave_at DESC
+         LIMIT ?
+        """,
+        [corridor_id, limit],
+    ).fetchall()
+    return [
+        CorpusRow(
+            forecast_id=fid, leave_at=leave_at, predictor_version=pv,
+            direction_code=dir_code,
+            predicted_total_p50=p50, predicted_total_p80=p80, predicted_total_p90=p90,
+            actual_total_seconds=actual, in_p80_window=in_p80,
+            p50_residual_seconds=resid, truth_confidence=trustconf, status=stat,
+        )
+        for (
+            fid, leave_at, pv, dir_code, p50, p80, p90,
+            actual, in_p80, resid, trustconf, stat,
+        ) in rows
+    ]
+
+
+@dataclass(frozen=True)
+class CorpusCorridorSummary:
+    corridor_id: str
+    mode: str
+    line: str
+    direction: str
+    origin_label: str
+    destination_label: str
+    n_predictions: int
+    n_resolved: int
+    n_unresolvable: int
+    coverage_p80: float | None
+    median_p50_residual_seconds: float | None
+    median_truth_confidence: float | None
+    last_predicted_at: datetime | None
+
+
+def corpus_summary(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    high_confidence_only: bool = False,
+    confidence_threshold: float = 0.5,
+) -> list[CorpusCorridorSummary]:
+    """Per-corridor coverage + residual stats, joining corridors -> outcomes.
+
+    ``high_confidence_only`` excludes outcomes with ``truth_confidence``
+    below ``confidence_threshold`` (spec: low-confidence truths should be
+    excluded from headline metrics).
+    """
+    # Reader may be hitting an older DB whose schema predates the
+    # corridors table; return empty rather than blowing up the dashboard.
+    has_corridors = conn.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'corridors'"
+    ).fetchone()
+    if not has_corridors or not has_corridors[0]:
+        return []
+
+    threshold = confidence_threshold if high_confidence_only else -1.0
+    rows = conn.execute(
+        """
+        SELECT c.corridor_id, c.mode, c.line, c.direction,
+               c.origin_label, c.destination_label,
+               COUNT(q.forecast_id) AS n_predictions,
+               SUM(CASE WHEN q.status = 'resolved' THEN 1 ELSE 0 END) AS n_resolved,
+               SUM(CASE WHEN q.status = 'unresolvable' THEN 1 ELSE 0 END) AS n_unresolvable,
+               AVG(CASE WHEN o.in_p80_window IS NOT NULL
+                            AND COALESCE(o.truth_confidence, 0) >= ?
+                       THEN (CASE WHEN o.in_p80_window THEN 1.0 ELSE 0.0 END) END) AS cov80,
+               MEDIAN(CASE WHEN COALESCE(o.truth_confidence, 0) >= ?
+                            THEN o.p50_residual_seconds END) AS median_p50_residual,
+               MEDIAN(o.truth_confidence) AS median_tc,
+               c.last_predicted_at
+          FROM corridors c
+          LEFT JOIN forecast_queue q ON q.corridor_id = c.corridor_id
+          LEFT JOIN forecast_outcomes o ON o.forecast_id = q.forecast_id
+         GROUP BY c.corridor_id, c.mode, c.line, c.direction,
+                  c.origin_label, c.destination_label, c.last_predicted_at
+         ORDER BY c.priority ASC, c.corridor_id
+        """,
+        [threshold, threshold],
+    ).fetchall()
+    return [
+        CorpusCorridorSummary(
+            corridor_id=cid, mode=mode, line=line, direction=direction,
+            origin_label=origin, destination_label=destination,
+            n_predictions=n_pred or 0,
+            n_resolved=n_resolved or 0,
+            n_unresolvable=n_unresolvable or 0,
+            coverage_p80=cov80,
+            median_p50_residual_seconds=median_resid,
+            median_truth_confidence=median_tc,
+            last_predicted_at=last_at,
+        )
+        for (
+            cid, mode, line, direction, origin, destination,
+            n_pred, n_resolved, n_unresolvable,
+            cov80, median_resid, median_tc, last_at,
+        ) in rows
+    ]
+
+
 def status(conn: duckdb.DuckDBPyConnection) -> Status:
     raw = conn.execute("SELECT COUNT(*), MAX(polled_at) FROM train_arrivals_raw").fetchone() or (0, None)
     runs = conn.execute("SELECT COUNT(*) FROM train_runs_observed").fetchone() or (0,)

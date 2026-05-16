@@ -1,10 +1,15 @@
 """Main loop. Polls the CTA API round-robin, writes raw arrivals, builds
-observed runs, generates random trip forecasts, and resolves due ones.
+observed runs, issues corridor-driven forecasts, and resolves due ones.
 
 Rate budget: 100 requests per 5-minute window per key (~1 per 3s).
 `Settings.station_round_robin_batch` controls how many stations we poll
 each tick (default 18 per 30s tick = 36/min, well under the cap with
 headroom for retries).
+
+Trip generation: each tick, corridors whose ``cadence_seconds`` has
+elapsed since their last prediction are predicted in priority order, up
+to ``trips_per_generation_tick``. Random sampling is gone; the corpus
+is corridor-driven now (see ``corridors.py`` / ``corpus.py``).
 """
 
 from __future__ import annotations
@@ -12,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
-import random
 import signal
 from datetime import datetime, timedelta
 from typing import Iterable
@@ -22,26 +26,17 @@ import structlog
 
 from . import db, trajectory
 from .bus_client import CTABusClient
-from .bus_predictor import build_observed_bus_runs, enqueue_bus_forecast, predict_bus_trip, sample_bus_trip
+from .bus_predictor import build_observed_bus_runs
 from .catalog import LStation, load_catalog
 from .config import CHICAGO, Settings, settings
+from .corpus import predict_and_enqueue_corridor
+from .corridors import due_corridors, seed_corridors
 from .cta_train_client import ArrivalRaw, CTATrainClient
 from .intercampus_client import IntercampusClient
-from .intercampus_predictor import (
-    build_observed_intercampus_trips,
-    enqueue_intercampus_forecast,
-    predict_intercampus_trip,
-    sample_intercampus_trip,
-)
+from .intercampus_predictor import build_observed_intercampus_trips
 from .metra_client import MetraClient
-from .metra_predictor import (
-    build_observed_metra_trips,
-    enqueue_metra_forecast,
-    predict_metra_trip,
-    sample_metra_trip,
-)
+from .metra_predictor import build_observed_metra_trips
 from .resolver import resolve_due_forecasts
-from .trip_generator import enqueue_forecast, predict_trip, sample_trip
 
 log = structlog.get_logger(__name__)
 
@@ -73,7 +68,6 @@ async def run(stngs: Settings = settings) -> None:
     last_bus_poll = datetime.now(CHICAGO)
     last_metra_poll = datetime.now(CHICAGO)
     last_intercampus_poll = datetime.now(CHICAGO)
-    rng = random.Random()
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -81,6 +75,8 @@ async def run(stngs: Settings = settings) -> None:
         loop.add_signal_handler(sig, stop_event.set)
 
     with db.writer() as conn:
+        n_seeded = seed_corridors(conn, now=datetime.now(CHICAGO))
+        log.info("corridors.seeded", n=n_seeded)
         try:
             while not stop_event.is_set():
                 tick_started = datetime.now(CHICAGO)
@@ -127,17 +123,14 @@ async def run(stngs: Settings = settings) -> None:
                     if metra_client:
                         enabled_modes.append("metra")
                     enabled_modes.append("intercampus")  # no key needed
-                    n_enqueued = _generate_trips_multimodal(
+                    n_enqueued = _generate_corridor_predictions(
                         conn,
-                        catalog=catalog,
-                        rng=rng,
                         now=tick_started,
-                        count=stngs.trips_per_generation_tick,
                         enabled_modes=enabled_modes,
-                        monitored_bus_stops=list(stngs.monitored_bus_stops),
+                        max_per_tick=stngs.trips_per_generation_tick,
                     )
                     if n_enqueued:
-                        log.info("trips.enqueued", n=n_enqueued)
+                        log.info("corpus.enqueued", n=n_enqueued)
                     last_trip_gen = tick_started
 
                 if (tick_started - last_resolver).total_seconds() >= stngs.resolver_interval_seconds:
@@ -351,86 +344,25 @@ async def _poll_intercampus(
     return len(rows)
 
 
-def _generate_trips(
-    conn: duckdb.DuckDBPyConnection,
-    catalog: list[LStation],
-    *,
-    rng: random.Random,
-    now: datetime,
-    count: int,
-) -> int:
-    n = 0
-    for _ in range(count):
-        spec = sample_trip(catalog, rng=rng, leave_at=now)
-        if spec is None:
-            continue
-        forecast = predict_trip(conn, spec, now=now)
-        if forecast is None:
-            continue
-        wait, in_vehicle = forecast
-        enqueue_forecast(conn, spec=spec, wait=wait, in_vehicle=in_vehicle, now=now, snapshot_polled_at=now)
-        n += 1
-    return n
-
-
-def _generate_trips_multimodal(
+def _generate_corridor_predictions(
     conn: duckdb.DuckDBPyConnection,
     *,
-    catalog: list[LStation],
-    rng: random.Random,
     now: datetime,
-    count: int,
     enabled_modes: list[str],
-    monitored_bus_stops: list[tuple[str, int]],
+    max_per_tick: int,
 ) -> int:
+    """Cycle through corridors whose cadence has elapsed and predict each.
+
+    Each corridor produces at most one synthetic prediction per cadence
+    window. ``max_per_tick`` caps how many we issue per generation tick so
+    a long backlog doesn't burst-write hundreds of rows; corridors not
+    serviced this tick come back next tick.
+    """
+    due = due_corridors(conn, now=now, enabled_modes=enabled_modes)
     n = 0
-    for _ in range(count):
-        mode = rng.choice(enabled_modes)
-        if mode == "L":
-            spec = sample_trip(catalog, rng=rng, leave_at=now)
-            if spec is None:
-                continue
-            forecast = predict_trip(conn, spec, now=now)
-            if forecast is None:
-                continue
-            wait, in_vehicle = forecast
-            enqueue_forecast(conn, spec=spec, wait=wait, in_vehicle=in_vehicle, now=now, snapshot_polled_at=now)
-            n += 1
-        elif mode == "bus":
-            spec = sample_bus_trip(monitored_stops=monitored_bus_stops, rng=rng, leave_at=now)
-            if spec is None:
-                continue
-            forecast = predict_bus_trip(conn, spec, now=now)
-            if forecast is None:
-                continue
-            wait, in_vehicle = forecast
-            enqueue_bus_forecast(conn, spec=spec, wait=wait, in_vehicle=in_vehicle, now=now, snapshot_polled_at=now)
-            n += 1
-        elif mode == "metra":
-            spec = sample_metra_trip(rng=rng, leave_at=now)
-            if spec is None:
-                continue
-            forecast = predict_metra_trip(conn, spec, now=now)
-            if forecast is None:
-                continue
-            wait, in_vehicle, direction_id = forecast
-            enqueue_metra_forecast(
-                conn, spec=spec, wait=wait, in_vehicle=in_vehicle,
-                direction_id=direction_id, now=now, snapshot_polled_at=now,
-            )
-            n += 1
-        elif mode == "intercampus":
-            spec = sample_intercampus_trip(rng=rng, leave_at=now)
-            if spec is None:
-                continue
-            forecast = predict_intercampus_trip(conn, spec, now=now)
-            if forecast is None:
-                continue
-            wait, in_vehicle, direction = forecast
-            enqueue_intercampus_forecast(
-                conn, spec=spec, wait=wait, in_vehicle=in_vehicle,
-                direction=direction, now=now, snapshot_polled_at=now,
-            )
+    for corridor in due[:max_per_tick]:
+        result = predict_and_enqueue_corridor(conn, corridor, now=now)
+        if result is not None:
             n += 1
     return n
 
