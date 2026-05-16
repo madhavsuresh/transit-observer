@@ -85,6 +85,7 @@ def resolve_due_forecasts(
                 )
                 n_unresolvable += 1
             continue
+        truth_conf = _truth_confidence(conn, forecast, outcome)
         conn.execute(
             """
             INSERT INTO forecast_outcomes (
@@ -92,8 +93,9 @@ def resolve_due_forecasts(
                 boarded_at, alighted_at,
                 actual_wait_seconds, actual_in_vehicle_seconds, actual_total_seconds,
                 in_p80_window, in_p90_window,
-                p50_residual_seconds, p80_residual_seconds, failed, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                p50_residual_seconds, p80_residual_seconds,
+                truth_confidence, failed, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (forecast_id) DO NOTHING
             """,
             [
@@ -109,6 +111,7 @@ def resolve_due_forecasts(
                 outcome["actual_total_seconds"] <= forecast.predicted_total_p90,
                 outcome["actual_total_seconds"] - forecast.predicted_total_p50,
                 outcome["actual_total_seconds"] - forecast.predicted_total_p80,
+                truth_conf,
                 False,
                 outcome.get("notes"),
             ],
@@ -171,6 +174,117 @@ def _resolve_mode(conn: duckdb.DuckDBPyConnection, f: _Forecast, *, now: datetim
             now=now,
         )
     log.warning("resolver.unknown_mode", mode=f.mode)
+    return None
+
+
+# Truth confidence -----------------------------------------------------
+#
+# How cleanly do the raw feed samples bracket the boarded run? More
+# samples near boarded_at and alighted_at => higher confidence in the
+# *truth* (independent of the prediction). Used by metrics to weight or
+# exclude noisy outcomes from headline accuracy figures.
+#
+# Heuristic per mode: count raw rows in a ±10-min window around each
+# endpoint, weighted by `is_approaching` when the feed has that signal
+# (L, bus). Return a value in [0, 1] capped at 1.0 once we have enough
+# evidence at both endpoints.
+
+_TRUTH_WINDOW_SECONDS = 600.0
+_TRUTH_SCORE_CAP = 4.0  # 2 approaching + 2 dropoff samples at each endpoint
+
+
+def _truth_confidence(
+    conn: duckdb.DuckDBPyConnection, f: _Forecast, outcome: dict,
+) -> float:
+    boarded_at = outcome.get("boarded_at")
+    alighted_at = outcome.get("alighted_at")
+    if boarded_at is None or alighted_at is None:
+        return 0.0
+    board_signal = _endpoint_signal(conn, f, ts=boarded_at, side="boarding")
+    alight_signal = _endpoint_signal(conn, f, ts=alighted_at, side="alighting")
+    if board_signal is None or alight_signal is None:
+        return 0.0
+    score = min(board_signal, alight_signal) / _TRUTH_SCORE_CAP
+    return max(0.0, min(1.0, score))
+
+
+def _endpoint_signal(
+    conn: duckdb.DuckDBPyConnection, f: _Forecast, *, ts: datetime, side: str,
+) -> float | None:
+    """Sample-density score at one endpoint of the boarded run.
+
+    Approaching samples count 1.5x, scheduled-only rows 0.5x, plain
+    arrivals 1.0x. Mode-specific because each feed has different signals.
+    """
+    lo = ts - timedelta(seconds=_TRUTH_WINDOW_SECONDS)
+    hi = ts + timedelta(seconds=_TRUTH_WINDOW_SECONDS)
+
+    if f.mode == "L":
+        map_id = f.boarding_map_id if side == "boarding" else f.alighting_map_id
+        rows = conn.execute(
+            """
+            SELECT COUNT(*) FILTER (WHERE is_approaching = TRUE),
+                   COUNT(*) FILTER (WHERE COALESCE(is_approaching, FALSE) = FALSE
+                                    AND COALESCE(is_scheduled, FALSE) = FALSE),
+                   COUNT(*) FILTER (WHERE COALESCE(is_scheduled, FALSE) = TRUE)
+              FROM train_arrivals_raw
+             WHERE line = ? AND map_id = ?
+               AND arrival_at BETWEEN ? AND ?
+            """,
+            [f.line, map_id, lo, hi],
+        ).fetchone()
+        if rows is None:
+            return 0.0
+        approaching, plain, scheduled = (r or 0 for r in rows)
+        return 1.5 * approaching + 1.0 * plain + 0.5 * scheduled
+
+    if f.mode == "bus":
+        stop_id = int(f.boarding_text_id if side == "boarding" else (f.alighting_text_id or 0) or 0)
+        rows = conn.execute(
+            """
+            SELECT COUNT(*) FILTER (WHERE is_approaching = TRUE),
+                   COUNT(*) FILTER (WHERE COALESCE(is_approaching, FALSE) = FALSE)
+              FROM bus_predictions_raw
+             WHERE route = ? AND stop_id = ?
+               AND arrival_at BETWEEN ? AND ?
+            """,
+            [f.line, stop_id, lo, hi],
+        ).fetchone()
+        if rows is None:
+            return 0.0
+        approaching, plain = (r or 0 for r in rows)
+        return 1.5 * approaching + 1.0 * plain
+
+    if f.mode == "metra":
+        station_id = f.boarding_text_id if side == "boarding" else f.alighting_text_id
+        if station_id is None:
+            return 0.0
+        n = conn.execute(
+            """
+            SELECT COUNT(*)
+              FROM metra_arrivals_raw
+             WHERE route_id = ? AND station_id = ?
+               AND predicted_at BETWEEN ? AND ?
+            """,
+            [f.line, station_id, lo, hi],
+        ).fetchone()
+        return float((n[0] if n else 0) or 0)
+
+    if f.mode == "intercampus":
+        stop_id = f.boarding_text_id if side == "boarding" else f.alighting_text_id
+        if stop_id is None:
+            return 0.0
+        n = conn.execute(
+            """
+            SELECT COUNT(*)
+              FROM intercampus_arrivals_raw
+             WHERE stop_id = ?
+               AND predicted_at BETWEEN ? AND ?
+            """,
+            [stop_id, lo, hi],
+        ).fetchone()
+        return float((n[0] if n else 0) or 0)
+
     return None
 
 

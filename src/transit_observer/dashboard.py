@@ -16,7 +16,7 @@ import streamlit as st
 from transit_observer import db
 from transit_observer.config import CHICAGO, settings
 from transit_observer.direction_audit import audit_summary
-from transit_observer.metrics import corridor_coverage, status
+from transit_observer.metrics import corpus_summary, corridor_coverage, status
 
 
 st.set_page_config(page_title="transit-observer", layout="wide")
@@ -94,6 +94,34 @@ def _audit_df(min_samples: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
+def _corpus_df(high_confidence_only: bool) -> pd.DataFrame:
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        rows = corpus_summary(conn, high_confidence_only=high_confidence_only)
+    return pd.DataFrame(
+        [
+            {
+                "corridor_id": r.corridor_id,
+                "mode": r.mode,
+                "line": r.line,
+                "direction": r.direction,
+                "origin": r.origin_label,
+                "destination": r.destination_label,
+                "n_predictions": r.n_predictions,
+                "n_resolved": r.n_resolved,
+                "n_unresolvable": r.n_unresolvable,
+                "coverage_p80": r.coverage_p80,
+                "median_p50_residual_s": r.median_p50_residual_seconds,
+                "median_truth_confidence": r.median_truth_confidence,
+                "last_predicted_at": r.last_predicted_at,
+            }
+            for r in rows
+        ]
+    )
+
+
+@st.cache_data(ttl=30)
 def _residual_df(window_hours: int) -> pd.DataFrame:
     if not _db_ready():
         return pd.DataFrame()
@@ -157,6 +185,24 @@ def _render() -> None:
             .properties(height=300)
         )
         st.altair_chart(chart, use_container_width=True)
+
+    st.divider()
+    st.subheader("Corpus corridors")
+    hi_conf = st.sidebar.checkbox("Headline metrics: high-confidence truths only", value=True)
+    corpus = _corpus_df(hi_conf)
+    if corpus.empty:
+        st.info("No corridors seeded yet -- start the collector.")
+    else:
+        st.dataframe(
+            corpus,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "coverage_p80": st.column_config.NumberColumn("p80 coverage", format="%.1f%%"),
+                "median_p50_residual_s": st.column_config.NumberColumn("median p50 residual (s)", format="%.0f"),
+                "median_truth_confidence": st.column_config.NumberColumn("median truth conf", format="%.2f"),
+            },
+        )
 
     st.divider()
     st.subheader("Direction-filter audit (recall + direction-precision)")
