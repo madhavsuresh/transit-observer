@@ -19,8 +19,12 @@ from transit_observer.corpus import predict_for_od
 from transit_observer.corridors import SEED_CORRIDORS
 from transit_observer.direction_audit import audit_summary
 from transit_observer.metrics import (
+    active_predictor_rows,
+    available_predictors,
+    best_predictor_per_corridor,
     corpus_summary,
     corridor_coverage,
+    crps_per_predictor,
     diagnose_pit_shape,
     historical_prediction,
     live_data_diagnostic,
@@ -71,11 +75,13 @@ def _status_dict() -> dict:
 
 
 @st.cache_data(ttl=30)
-def _coverage_df(min_samples: int) -> pd.DataFrame:
+def _coverage_df(min_samples: int, predictor_version: str | None = None) -> pd.DataFrame:
     if not _db_ready():
         return pd.DataFrame()
     with db.reader() as conn:
-        rows = corridor_coverage(conn, min_samples=min_samples)
+        rows = corridor_coverage(
+            conn, min_samples=min_samples, predictor_version=predictor_version,
+        )
     return pd.DataFrame(
         [
             {
@@ -169,16 +175,18 @@ def _residual_df(window_hours: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
-def _reliability_df(min_samples: int, mode: str = "per_line") -> pd.DataFrame:
+def _reliability_df(
+    min_samples: int, mode: str = "per_line", predictor_version: str | None = None,
+) -> pd.DataFrame:
     """``mode`` = 'per_line' (split by line, min_samples gate applied) or
     'aggregated' (all data combined under line='ALL')."""
     if not _db_ready():
         return pd.DataFrame()
     with db.reader() as conn:
         if mode == "aggregated":
-            rows = reliability_curve_aggregated(conn)
+            rows = reliability_curve_aggregated(conn, predictor_version=predictor_version)
         else:
-            rows = reliability_curve(conn, min_samples=min_samples)
+            rows = reliability_curve(conn, min_samples=min_samples, predictor_version=predictor_version)
     return pd.DataFrame(
         [
             {
@@ -193,14 +201,19 @@ def _reliability_df(min_samples: int, mode: str = "per_line") -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
-def _pit_df(min_samples: int, n_bins: int, mode: str = "per_line") -> pd.DataFrame:
+def _pit_df(
+    min_samples: int, n_bins: int, mode: str = "per_line",
+    predictor_version: str | None = None,
+) -> pd.DataFrame:
     if not _db_ready():
         return pd.DataFrame()
     with db.reader() as conn:
         if mode == "aggregated":
-            rows = pit_histogram_aggregated(conn, n_bins=n_bins)
+            rows = pit_histogram_aggregated(conn, n_bins=n_bins, predictor_version=predictor_version)
         else:
-            rows = pit_histogram(conn, n_bins=n_bins, min_samples=min_samples)
+            rows = pit_histogram(
+                conn, n_bins=n_bins, min_samples=min_samples, predictor_version=predictor_version,
+            )
     return pd.DataFrame(
         [
             {
@@ -216,13 +229,13 @@ def _pit_df(min_samples: int, n_bins: int, mode: str = "per_line") -> pd.DataFra
 
 
 @st.cache_data(ttl=30)
-def _line_counts_df() -> pd.DataFrame:
+def _line_counts_df(predictor_version: str | None = None) -> pd.DataFrame:
     """Per (mode, line) breakdown of resolved-forecast counts — lets the
     user see which lines have enough data to show up in PIT/reliability."""
     if not _db_ready():
         return pd.DataFrame()
     with db.reader() as conn:
-        rows = per_line_resolved_counts(conn)
+        rows = per_line_resolved_counts(conn, predictor_version=predictor_version)
     return pd.DataFrame(
         [
             {
@@ -232,6 +245,68 @@ def _line_counts_df() -> pd.DataFrame:
                 "n_high_conf": r.n_resolved_high_conf,
             }
             for r in rows
+        ]
+    )
+
+
+@st.cache_data(ttl=30)
+def _available_predictors() -> list[tuple[str, int]]:
+    """Predictor_versions present in resolved forecasts (with row counts)."""
+    if not _db_ready():
+        return []
+    with db.reader() as conn:
+        return available_predictors(conn)
+
+
+@st.cache_data(ttl=30)
+def _active_predictor_df() -> pd.DataFrame:
+    """Which predictor is active per corridor + the pending-challenger streak."""
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        rows = active_predictor_rows(conn)
+    return pd.DataFrame(
+        [
+            {
+                "corridor_id": r.corridor_id,
+                "active": r.predictor_version,
+                "score": r.decided_score,
+                "decided_at": r.decided_at,
+                "challenger": r.pending_candidate or "—",
+                "challenger_wins": r.pending_wins,
+                "challenger_score": r.pending_score,
+            }
+            for r in rows
+        ]
+    )
+
+
+@st.cache_data(ttl=30)
+def _predictor_scoreboard_df(min_samples: int = 30) -> pd.DataFrame:
+    """Long-format scoreboard: one row per (predictor, line, direction)."""
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        scores = crps_per_predictor(conn, min_samples=min_samples)
+    return pd.DataFrame(
+        [
+            {
+                "predictor": s.predictor_version,
+                "line": s.line,
+                "direction": s.direction_code or "?",
+                "n": s.n,
+                "crps": s.crps,
+                "pinball_q50": s.pinball_q50,
+                "pinball_q80": s.pinball_q80,
+                "pinball_q90": s.pinball_q90,
+                "coverage_p80": s.coverage_p80,
+                "coverage_p90": s.coverage_p90,
+                "coverage_gap_p80": s.coverage_gap_p80,
+                "tail_miss_p90": s.tail_miss_p90_rate,
+                "interval_score_p50_p90": s.interval_score_p50_p90,
+                "decision_loss": s.decision_loss,
+            }
+            for s in scores
         ]
     )
 
@@ -387,9 +462,161 @@ def _render_live_forecast_tab() -> None:
         )
 
 
+_ALL_PREDICTORS = "all (compare in scoreboard)"
+
+
+def _render_predictors_section() -> None:
+    """Active assignments + head-to-head scoreboard.
+
+    Always shows all predictors regardless of the sidebar filter — this
+    section's whole point is the comparison.
+    """
+    st.subheader("Predictors")
+    st.caption(
+        "Which predictor is serving each corridor, and how every "
+        "predictor scores against realized outcomes. The registry "
+        "auto-promotes a candidate once it beats the incumbent on "
+        "CRPS + 0.05·coverage_gap for two consecutive evaluation "
+        "windows by ≥ 0.005."
+    )
+
+    active = _active_predictor_df()
+    if active.empty:
+        st.info(
+            "No `predictor_active` rows yet. The registry seeds rows on "
+            "first promotion attempt — `transit predictors switch <c> <v>` "
+            "or the in-collector trainer will populate this once data "
+            "accumulates."
+        )
+    else:
+        # Headline: who's serving most corridors?
+        version_counts = (
+            active["active"].value_counts().rename_axis("predictor").reset_index(name="n_corridors")
+        )
+        cols = st.columns(min(4, len(version_counts)))
+        for i, row in version_counts.iterrows():
+            cols[i % len(cols)].metric(row["predictor"], f"{row['n_corridors']} corridors")
+        st.markdown("**Active predictor per corridor** (with pending challenger streak):")
+        st.dataframe(
+            active,
+            hide_index=True, use_container_width=True,
+            column_config={
+                "score": st.column_config.NumberColumn("score", format="%.4f"),
+                "challenger_score": st.column_config.NumberColumn("challenger score", format="%.4f"),
+            },
+        )
+
+    scoreboard_min = st.sidebar.slider(
+        "Scoreboard: min samples per (predictor, line, dir)",
+        min_value=10, max_value=200, value=30, step=10,
+    )
+    scores = _predictor_scoreboard_df(min_samples=scoreboard_min)
+    if scores.empty:
+        st.info(
+            f"No (predictor, line, direction) buckets with ≥{scoreboard_min} "
+            "resolved outcomes yet. Lower the threshold in the sidebar or "
+            "wait for more forecasts to resolve."
+        )
+        return
+
+    st.markdown("**Head-to-head scoreboard** (lower is better for CRPS, "
+                "pinball, interval score, decision loss):")
+    st.dataframe(
+        scores.sort_values(["line", "direction", "decision_loss"]),
+        hide_index=True, use_container_width=True,
+        column_config={
+            "crps": st.column_config.NumberColumn(format="%.2f"),
+            "pinball_q50": st.column_config.NumberColumn(format="%.2f"),
+            "pinball_q80": st.column_config.NumberColumn(format="%.2f"),
+            "pinball_q90": st.column_config.NumberColumn(format="%.2f"),
+            "coverage_p80": st.column_config.NumberColumn(format="%.1%%"),
+            "coverage_p90": st.column_config.NumberColumn(format="%.1%%"),
+            "coverage_gap_p80": st.column_config.NumberColumn(format="%.3f"),
+            "tail_miss_p90": st.column_config.NumberColumn(format="%.1%%"),
+            "interval_score_p50_p90": st.column_config.NumberColumn(format="%.1f"),
+            "decision_loss": st.column_config.NumberColumn(format="%.4f"),
+        },
+    )
+
+    # Visual: decision loss per (line, direction), bar per predictor.
+    # Predictors with the lowest bar in each group win.
+    scores_long = scores.assign(
+        bucket=lambda d: d["line"].astype(str) + " " + d["direction"].astype(str),
+    )
+    chart = (
+        alt.Chart(scores_long)
+        .mark_bar()
+        .encode(
+            x=alt.X("predictor:N", title=None, axis=alt.Axis(labels=False, ticks=False)),
+            y=alt.Y("decision_loss:Q", title="decision loss (lower is better)"),
+            color=alt.Color("predictor:N", legend=alt.Legend(orient="bottom")),
+            tooltip=["predictor", "line", "direction", "n", "crps",
+                     "coverage_p80", "coverage_gap_p80", "decision_loss"],
+            column=alt.Column("bucket:N", title=None, header=alt.Header(labelOrient="bottom")),
+        )
+        .properties(width=70, height=200)
+    )
+    st.altair_chart(chart, use_container_width=False)
+    st.caption(
+        "Each cluster = one (line, direction) bucket; bars within a "
+        "cluster compare predictors. Anywhere a non-kernel bar is lower "
+        "than the kernel bar, that predictor is the current promotion "
+        "candidate for that corridor."
+    )
+
+    # CRPS vs coverage gap scatter — clarity on the accuracy/calibration tradeoff
+    st.markdown("**CRPS vs. coverage gap** "
+                "(top-left quadrant is the goal: sharp + well-calibrated):")
+    scatter = (
+        alt.Chart(scores)
+        .mark_circle(size=140, opacity=0.7)
+        .encode(
+            x=alt.X("coverage_gap_p80:Q", title="|coverage − 0.8|  (calibration gap)"),
+            y=alt.Y("crps:Q", title="CRPS  (accuracy)"),
+            color=alt.Color("predictor:N", legend=alt.Legend(orient="right")),
+            tooltip=["predictor", "line", "direction", "n", "crps",
+                     "coverage_p80", "coverage_gap_p80", "decision_loss"],
+        )
+        .properties(height=320)
+    )
+    st.altair_chart(scatter, use_container_width=True)
+
+
+def _predictor_filter() -> str | None:
+    """Sidebar widget: which predictor to filter every existing chart by.
+
+    Returns ``None`` when "all" is selected so the downstream metrics
+    aggregate across every predictor. Default highlights whichever
+    predictor has the most resolved rows (typically kernel-v1 today,
+    gbm-v1 later).
+    """
+    pairs = _available_predictors()
+    if not pairs:
+        return None
+    labels = [_ALL_PREDICTORS] + [f"{pv}  (n={n:,})" for pv, n in pairs]
+    choice = st.sidebar.selectbox(
+        "Predictor (filters charts below)",
+        labels,
+        index=0,
+        help=(
+            "Filters every chart on this page to one predictor's forecasts. "
+            "The 'Predictors' section at the bottom compares them all "
+            "head-to-head regardless of this selection."
+        ),
+    )
+    if choice == _ALL_PREDICTORS:
+        return None
+    # Strip the "  (n=...)" suffix
+    return choice.split("  (n=")[0]
+
+
 def _render() -> None:
     st.title("transit-observer")
-    st.caption("Long-running validator for the Cozy Fox journey kernels.")
+    st.caption(
+        "Long-running validator for the Cozy Fox journey kernel and the "
+        "learned residual-quantile GBM. Sidebar predictor filter applies "
+        "to every chart except the Predictors scoreboard at the bottom."
+    )
 
     if not _db_ready():
         st.warning(
@@ -403,11 +630,15 @@ def _render() -> None:
     for i, (label, value) in enumerate(status_data.items()):
         cols[i % 4].metric(label, value)
 
+    predictor_version = _predictor_filter()
+    if predictor_version is not None:
+        st.info(f"Charts below show forecasts from **{predictor_version}** only.")
+
     st.divider()
 
     st.subheader("Coverage by corridor")
     min_samples = st.sidebar.slider("Min samples per bucket", min_value=1, max_value=20, value=5)
-    coverage = _coverage_df(min_samples)
+    coverage = _coverage_df(min_samples, predictor_version=predictor_version)
     if coverage.empty:
         st.info(f"No buckets with ≥{min_samples} samples yet. Leave the collector running.")
     else:
@@ -435,7 +666,7 @@ def _render() -> None:
         "(p50, p80); see CALIBRATION_VIZ_DESIGN.md for rationale."
     )
 
-    line_counts = _line_counts_df()
+    line_counts = _line_counts_df(predictor_version=predictor_version)
     if line_counts.empty:
         st.info(
             "No resolved forecasts yet. Let the collector run until trips "
@@ -474,9 +705,9 @@ def _render() -> None:
             horizontal=True, key="reliability_view",
         )
         if view.startswith("aggregated"):
-            df = _reliability_df(min_samples=1, mode="aggregated")
+            df = _reliability_df(min_samples=1, mode="aggregated", predictor_version=predictor_version)
         else:
-            df = _reliability_df(min_samples=30, mode="per_line")
+            df = _reliability_df(min_samples=30, mode="per_line", predictor_version=predictor_version)
         if df.empty:
             st.info(
                 "No data for this view yet. Try 'aggregated' for the "
@@ -505,9 +736,15 @@ def _render() -> None:
             "PIT bins", min_value=5, max_value=40, value=20, step=5, key="pit_bins",
         )
         if view.startswith("aggregated"):
-            pit = _pit_df(min_samples=1, n_bins=n_bins, mode="aggregated")
+            pit = _pit_df(
+                min_samples=1, n_bins=n_bins, mode="aggregated",
+                predictor_version=predictor_version,
+            )
         else:
-            pit = _pit_df(min_samples=30, n_bins=n_bins, mode="per_line")
+            pit = _pit_df(
+                min_samples=30, n_bins=n_bins, mode="per_line",
+                predictor_version=predictor_version,
+            )
         if pit.empty:
             st.info(
                 "No data for this view. Try 'aggregated' first; the "
@@ -569,6 +806,9 @@ def _render() -> None:
             )
     with tabs[4]:
         _render_live_forecast_tab()
+
+    st.divider()
+    _render_predictors_section()
 
     st.divider()
     st.subheader("Corpus corridors")
