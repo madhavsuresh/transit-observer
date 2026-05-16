@@ -10,7 +10,17 @@ import duckdb
 import pytest
 
 from transit_observer import db
-from transit_observer.metrics import pit_histogram, reliability_curve
+from transit_observer.metrics import (
+    diagnose_pit_shape,
+    historical_prediction,
+    live_data_diagnostic,
+    per_line_resolved_counts,
+    pit_histogram,
+    pit_histogram_aggregated,
+    reliability_curve,
+    reliability_curve_aggregated,
+)
+from transit_observer.metrics import PitBin
 
 
 T0 = datetime(2026, 1, 1, 8, 0, 0, tzinfo=timezone.utc)
@@ -127,3 +137,190 @@ def test_reliability_curve_filter_by_line(conn):
     _insert_calibrated_lognormal(conn, line="Blue", mu=5.5, sigma=0.6, n=200, seed=4)
     only_red = reliability_curve(conn, line="Red", min_samples=50)
     assert {p.line for p in only_red} == {"Red"}
+
+
+def test_pit_aggregated_pools_all_lines(conn):
+    _insert_calibrated_lognormal(conn, line="Red", mu=6.2, sigma=0.4, n=200, seed=5)
+    _insert_calibrated_lognormal(conn, line="Blue", mu=5.5, sigma=0.6, n=200, seed=6)
+    bins = pit_histogram_aggregated(conn, n_bins=10)
+    assert len(bins) == 10
+    assert all(b.line == "ALL" for b in bins)
+    assert sum(b.count for b in bins) == 400
+
+
+def test_reliability_aggregated_pools_all_lines(conn):
+    _insert_calibrated_lognormal(conn, line="Red", mu=6.2, sigma=0.4, n=200, seed=7)
+    _insert_calibrated_lognormal(conn, line="Blue", mu=5.5, sigma=0.6, n=200, seed=8)
+    points = reliability_curve_aggregated(conn)
+    assert len(points) == 9
+    assert all(p.line == "ALL" for p in points)
+    # Combined pool should still be approximately calibrated.
+    for p in points:
+        assert abs(p.empirical_coverage - p.nominal_quantile) < 0.07
+
+
+def test_pit_aggregated_returns_empty_when_no_data(conn):
+    assert pit_histogram_aggregated(conn, n_bins=10) == []
+
+
+def test_reliability_aggregated_returns_empty_when_no_data(conn):
+    assert reliability_curve_aggregated(conn) == []
+
+
+def test_per_line_resolved_counts(conn):
+    _insert_calibrated_lognormal(conn, line="Red", mu=6.2, sigma=0.4, n=50, seed=9)
+    _insert_calibrated_lognormal(conn, line="Blue", mu=5.5, sigma=0.6, n=25, seed=10)
+    counts = per_line_resolved_counts(conn)
+    by_line = {(c.mode, c.line): c.n_resolved for c in counts}
+    assert by_line.get(("L", "Red")) == 50
+    assert by_line.get(("L", "Blue")) == 25
+
+
+def test_per_line_resolved_counts_high_conf_filter(conn):
+    _insert_calibrated_lognormal(conn, line="Red", mu=6.2, sigma=0.4, n=10, truth_conf=0.2, seed=11)
+    _insert_calibrated_lognormal(conn, line="Blue", mu=6.2, sigma=0.4, n=10, truth_conf=0.9, seed=12)
+    counts = per_line_resolved_counts(conn, min_truth_confidence=0.5)
+    red = next(c for c in counts if c.line == "Red")
+    blue = next(c for c in counts if c.line == "Blue")
+    assert red.n_resolved == 10
+    assert red.n_resolved_high_conf == 0   # truth_conf=0.2 below threshold
+    assert blue.n_resolved == 10
+    assert blue.n_resolved_high_conf == 10
+
+
+def test_historical_prediction_empirical_quantiles(conn):
+    # Insert 100 resolved L-mode trips for the same OD with known
+    # actuals so we can check the empirical quantiles.
+    for i in range(100):
+        forecast_id = f"hist-{i}"
+        leave_at = T0 + timedelta(minutes=i)
+        actual_seconds = 600 + i * 6   # 600..1194s, evenly spaced
+        conn.execute(
+            """
+            INSERT INTO forecast_queue (
+                forecast_id, enqueued_at, snapshot_polled_at, leave_at,
+                mode, line, direction_code,
+                boarding_map_id, alighting_map_id,
+                predicted_total_p50, predicted_total_p80, predicted_total_p90,
+                resolve_after, status
+            ) VALUES (?, ?, ?, ?, 'L', 'Red', '1', 1234, 5678, 700, 900, 1000, ?, 'resolved')
+            """,
+            [forecast_id, leave_at, leave_at, leave_at, leave_at + timedelta(minutes=60)],
+        )
+        conn.execute(
+            """
+            INSERT INTO forecast_outcomes (
+                forecast_id, resolved_at, actual_total_seconds,
+                in_p80_window, in_p90_window, truth_confidence, failed
+            ) VALUES (?, ?, ?, TRUE, TRUE, 0.9, FALSE)
+            """,
+            [forecast_id, leave_at + timedelta(minutes=30), actual_seconds],
+        )
+    hist = historical_prediction(
+        conn, mode="L", line="Red",
+        boarding_int_id=1234, alighting_int_id=5678,
+    )
+    assert hist is not None
+    assert hist.n_samples == 100
+    # Linearly spaced 600..1194 → p50 ≈ midpoint, p80 ≈ 80%-ile
+    assert 870 < hist.p50_seconds < 920
+    assert 1070 < hist.p80_seconds < 1120
+    assert 1130 < hist.p90_seconds < 1200
+
+
+def test_historical_prediction_returns_none_below_threshold(conn):
+    # Only 4 resolved rows — below the n>=5 cutoff.
+    for i in range(4):
+        forecast_id = f"sparse-{i}"
+        leave_at = T0 + timedelta(minutes=i)
+        conn.execute(
+            """
+            INSERT INTO forecast_queue (
+                forecast_id, enqueued_at, snapshot_polled_at, leave_at,
+                mode, line, direction_code, boarding_map_id, alighting_map_id,
+                predicted_total_p50, predicted_total_p80, predicted_total_p90,
+                resolve_after, status
+            ) VALUES (?, ?, ?, ?, 'L', 'Red', '1', 99, 99, 700, 900, 1000, ?, 'resolved')
+            """,
+            [forecast_id, leave_at, leave_at, leave_at, leave_at + timedelta(minutes=60)],
+        )
+        conn.execute(
+            """
+            INSERT INTO forecast_outcomes (
+                forecast_id, resolved_at, actual_total_seconds,
+                in_p80_window, in_p90_window, truth_confidence, failed
+            ) VALUES (?, ?, ?, TRUE, TRUE, 0.9, FALSE)
+            """,
+            [forecast_id, leave_at + timedelta(minutes=30), 800],
+        )
+    assert historical_prediction(
+        conn, mode="L", line="Red",
+        boarding_int_id=99, alighting_int_id=99,
+    ) is None
+
+
+def test_live_data_diagnostic_reports_zero_when_empty(conn):
+    diag = live_data_diagnostic(
+        conn, mode="L", line="Red", boarding_int_id=1234,
+        now=T0,
+    )
+    assert diag.raw_rows_in_window == 0
+    assert diag.future_rows == 0
+    assert diag.last_raw_polled_at is None
+
+
+def test_live_data_diagnostic_counts_l_arrivals(conn):
+    # Seed 3 raw rows: one in the past, one approaching, one future.
+    for i, offset_s in enumerate([-120, 30, 300]):
+        conn.execute(
+            """
+            INSERT INTO train_arrivals_raw (
+                polled_at, line, run_number, map_id, stop_id,
+                direction_code, predicted_at, arrival_at,
+                is_approaching, is_delayed, is_fault, is_scheduled
+            ) VALUES (?, 'Red', ?, 1234, 0, '1', ?, ?, FALSE, FALSE, FALSE, FALSE)
+            """,
+            [
+                T0 - timedelta(seconds=10), f"R{i}",
+                T0 - timedelta(seconds=10), T0 + timedelta(seconds=offset_s),
+            ],
+        )
+    diag = live_data_diagnostic(
+        conn, mode="L", line="Red", boarding_int_id=1234, now=T0,
+    )
+    # All 3 within the polled_at >= T0-5min and arrival_at <= T0+30min window
+    assert diag.raw_rows_in_window == 3
+    # 2 with arrival_at >= now (the +30s and +300s ones)
+    assert diag.future_rows == 2
+
+
+def test_diagnose_pit_shape_flat_returns_calibrated():
+    bins = [
+        PitBin(line="ALL", bin_lower=i/10, bin_upper=(i+1)/10, count=100, density=1.0)
+        for i in range(10)
+    ]
+    diagnosis = diagnose_pit_shape(bins)
+    assert "calibrated" in diagnosis.lower()
+
+
+def test_diagnose_pit_shape_u_shape_detected():
+    # Heavy mass in first and last bins, light middle.
+    counts = [400, 50, 50, 50, 50, 50, 50, 50, 50, 400]
+    bins = [
+        PitBin(line="ALL", bin_lower=i/10, bin_upper=(i+1)/10,
+               count=c, density=c / sum(counts) / 0.1)
+        for i, c in enumerate(counts)
+    ]
+    diagnosis = diagnose_pit_shape(bins)
+    assert "U-shape" in diagnosis or "too tight" in diagnosis
+
+
+def test_diagnose_pit_shape_right_skew_actuals_slower():
+    counts = [10, 10, 10, 30, 50, 80, 150, 200, 250, 210]
+    bins = [
+        PitBin(line="ALL", bin_lower=i/10, bin_upper=(i+1)/10,
+               count=c, density=c / sum(counts) / 0.1)
+        for i, c in enumerate(counts)
+    ]
+    diagnosis = diagnose_pit_shape(bins)
+    assert "slower" in diagnosis or "right" in diagnosis

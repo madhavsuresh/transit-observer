@@ -285,6 +285,327 @@ def pit_histogram(
     return out
 
 
+@dataclass(frozen=True)
+class HistoricalPrediction:
+    """Empirical (p50, p80, p90) for one OD pair from past resolved forecasts.
+
+    Used by the dashboard as a fallback when the live predictor lacks
+    data. Each quantile is computed via nearest-rank from the sample of
+    actual_total_seconds values.
+    """
+    n_samples: int
+    p50_seconds: float
+    p80_seconds: float
+    p90_seconds: float
+    oldest_at: datetime | None
+    newest_at: datetime | None
+
+
+def historical_prediction(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    mode: str,
+    line: str,
+    boarding_int_id: int = 0,
+    boarding_text_id: str | None = None,
+    alighting_int_id: int = 0,
+    alighting_text_id: str | None = None,
+    limit: int = 200,
+) -> HistoricalPrediction | None:
+    """Empirical quantiles from past resolved forecasts for this OD pair.
+
+    Returns None when fewer than 5 resolved samples exist (anything less
+    gives meaningless quantiles).
+    """
+    rows = conn.execute(
+        """
+        SELECT o.actual_total_seconds, o.resolved_at
+          FROM forecast_outcomes o
+          JOIN forecast_queue q USING (forecast_id)
+         WHERE q.mode = ? AND q.line = ?
+           AND q.boarding_map_id = ? AND q.alighting_map_id = ?
+           AND COALESCE(q.boarding_text_id, '') = COALESCE(?, '')
+           AND COALESCE(q.alighting_text_id, '') = COALESCE(?, '')
+           AND q.status = 'resolved'
+           AND o.actual_total_seconds IS NOT NULL
+         ORDER BY o.resolved_at DESC
+         LIMIT ?
+        """,
+        [mode, line, boarding_int_id, alighting_int_id,
+         boarding_text_id, alighting_text_id, limit],
+    ).fetchall()
+    if len(rows) < 5:
+        return None
+    actuals = sorted(r[0] for r in rows)
+    resolved_ats = [r[1] for r in rows if r[1] is not None]
+    n = len(actuals)
+    return HistoricalPrediction(
+        n_samples=n,
+        p50_seconds=_nearest_rank(actuals, 0.5),
+        p80_seconds=_nearest_rank(actuals, 0.8),
+        p90_seconds=_nearest_rank(actuals, 0.9),
+        oldest_at=min(resolved_ats) if resolved_ats else None,
+        newest_at=max(resolved_ats) if resolved_ats else None,
+    )
+
+
+def _nearest_rank(sorted_values: list[float], p: float) -> float:
+    if not sorted_values:
+        return 0.0
+    n = len(sorted_values)
+    rank = max(1, math.ceil(p * n))
+    return sorted_values[min(rank, n) - 1]
+
+
+@dataclass(frozen=True)
+class LiveDataDiagnostic:
+    """What the live predictor sees when it tries to predict a corridor.
+
+    Distinguishes "no raw rows at all" (collector hasn't covered this
+    stop recently) from "rows exist but direction filter dropped them"
+    (a coverage problem with the direction filter).
+    """
+    mode: str
+    raw_rows_in_window: int        # arrivals at the boarding stop in the live window
+    future_rows: int               # subset where arrival_at >= now
+    last_raw_polled_at: datetime | None
+
+
+def live_data_diagnostic(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    mode: str,
+    line: str,
+    boarding_int_id: int = 0,
+    boarding_text_id: str | None = None,
+    now: datetime,
+    window_minutes: float = 30.0,
+) -> LiveDataDiagnostic:
+    """Count raw-feed rows at the boarding stop in the live window.
+
+    For L mode we count `train_arrivals_raw`; for bus, `bus_predictions_raw`;
+    for metra, `metra_arrivals_raw`; for intercampus, `intercampus_arrivals_raw`.
+    A zero count means the collector hasn't seen this stop recently —
+    nothing the predictor can do with that.
+    """
+    from datetime import timedelta as _td
+    cutoff = now - _td(minutes=5)
+    horizon = now + _td(minutes=window_minutes)
+    raw, future, last_at = 0, 0, None
+    if mode == "L":
+        row = conn.execute(
+            """
+            SELECT COUNT(*),
+                   COUNT(*) FILTER (WHERE arrival_at >= ?),
+                   MAX(polled_at)
+              FROM train_arrivals_raw
+             WHERE line = ? AND map_id = ?
+               AND polled_at >= ? AND arrival_at <= ?
+            """,
+            [now, line, boarding_int_id, cutoff, horizon],
+        ).fetchone()
+        raw, future, last_at = row or (0, 0, None)
+    elif mode == "bus":
+        stop_id = boarding_int_id or (int(boarding_text_id) if boarding_text_id else 0)
+        row = conn.execute(
+            """
+            SELECT COUNT(*),
+                   COUNT(*) FILTER (WHERE arrival_at >= ?),
+                   MAX(polled_at)
+              FROM bus_predictions_raw
+             WHERE route = ? AND stop_id = ?
+               AND polled_at >= ? AND arrival_at <= ?
+            """,
+            [now, line, stop_id, cutoff, horizon],
+        ).fetchone()
+        raw, future, last_at = row or (0, 0, None)
+    elif mode == "metra":
+        row = conn.execute(
+            """
+            SELECT COUNT(*),
+                   COUNT(*) FILTER (WHERE predicted_at >= ?),
+                   MAX(polled_at)
+              FROM metra_arrivals_raw
+             WHERE route_id = ? AND station_id = ?
+               AND polled_at >= ? AND predicted_at <= ?
+            """,
+            [now, line, boarding_text_id or "", cutoff, horizon],
+        ).fetchone()
+        raw, future, last_at = row or (0, 0, None)
+    elif mode == "intercampus":
+        row = conn.execute(
+            """
+            SELECT COUNT(*),
+                   COUNT(*) FILTER (WHERE predicted_at >= ?),
+                   MAX(polled_at)
+              FROM intercampus_arrivals_raw
+             WHERE stop_id = ?
+               AND polled_at >= ? AND predicted_at <= ?
+            """,
+            [now, boarding_text_id or "", cutoff, horizon],
+        ).fetchone()
+        raw, future, last_at = row or (0, 0, None)
+    return LiveDataDiagnostic(
+        mode=mode,
+        raw_rows_in_window=int(raw or 0),
+        future_rows=int(future or 0),
+        last_raw_polled_at=last_at,
+    )
+
+
+@dataclass(frozen=True)
+class LineSampleCount:
+    """Per-line breakdown of how many resolved forecasts back the calibration metrics."""
+    line: str
+    mode: str
+    n_resolved: int
+    n_resolved_high_conf: int
+
+
+def per_line_resolved_counts(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    min_truth_confidence: float = 0.5,
+) -> list[LineSampleCount]:
+    """How many resolved outcomes exist per (mode, line). Lets the dashboard
+    explain which lines are present in the PIT / reliability charts."""
+    rows = conn.execute(
+        """
+        SELECT q.mode, q.line,
+               COUNT(*) AS n_resolved,
+               COUNT(*) FILTER (WHERE COALESCE(o.truth_confidence, 0) >= ?) AS n_hi
+          FROM forecast_outcomes o
+          JOIN forecast_queue q USING (forecast_id)
+         WHERE q.status = 'resolved'
+           AND q.predicted_total_p50 > 0
+           AND q.predicted_total_p80 > q.predicted_total_p50
+           AND o.actual_total_seconds IS NOT NULL
+         GROUP BY q.mode, q.line
+         ORDER BY n_resolved DESC
+        """,
+        [min_truth_confidence],
+    ).fetchall()
+    return [
+        LineSampleCount(line=ln, mode=mode, n_resolved=int(nr), n_resolved_high_conf=int(nhi))
+        for mode, ln, nr, nhi in rows
+    ]
+
+
+def reliability_curve_aggregated(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    quantile_grid: tuple[float, ...] = _DEFAULT_RELIABILITY_GRID,
+    min_truth_confidence: float = 0.5,
+) -> list[ReliabilityPoint]:
+    """Reliability curve across all lines combined (line='ALL').
+
+    Less informative per-line but always has more samples — useful when
+    individual lines are below threshold.
+    """
+    rows = _resolved_forecasts_for_calibration(
+        conn, line=None, min_truth_confidence=min_truth_confidence,
+    )
+    if not rows:
+        return []
+    out: list[ReliabilityPoint] = []
+    for q in quantile_grid:
+        hits, n = 0, 0
+        for _ln, p50, p80, _p90, actual in rows:
+            try:
+                mu, sigma = fit_lognormal_from_p50_p80(p50, p80)
+            except ValueError:
+                continue
+            if actual <= lognormal_quantile(q, mu, sigma):
+                hits += 1
+            n += 1
+        if n:
+            out.append(ReliabilityPoint(
+                line="ALL", nominal_quantile=q, empirical_coverage=hits / n, n=n,
+            ))
+    return out
+
+
+def pit_histogram_aggregated(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    n_bins: int = 20,
+    min_truth_confidence: float = 0.5,
+) -> list[PitBin]:
+    """PIT histogram across all lines combined (line='ALL')."""
+    rows = _resolved_forecasts_for_calibration(
+        conn, line=None, min_truth_confidence=min_truth_confidence,
+    )
+    pits: list[float] = []
+    for _ln, p50, p80, _p90, actual in rows:
+        pit = pit_value(actual, p50, p80)
+        if math.isfinite(pit):
+            pits.append(pit)
+    if not pits:
+        return []
+    bin_width = 1.0 / n_bins
+    counts = [0] * n_bins
+    for pit in pits:
+        idx = min(int(pit / bin_width), n_bins - 1)
+        counts[idx] += 1
+    total = sum(counts)
+    return [
+        PitBin(
+            line="ALL",
+            bin_lower=i * bin_width,
+            bin_upper=(i + 1) * bin_width,
+            count=counts[i],
+            density=counts[i] / total / bin_width if total else 0.0,
+        )
+        for i in range(n_bins)
+    ]
+
+
+def diagnose_pit_shape(bins: list[PitBin]) -> str:
+    """Return a one-line plain-language interpretation of a PIT histogram.
+
+    Looks at the first and last 20% of bins vs the middle 60% to label
+    one of: calibrated / U-shape (too tight) / hump (too wide) /
+    left-skew (too slow) / right-skew (too fast).
+    """
+    if not bins:
+        return "no data"
+    by_line: dict[str, list[PitBin]] = {}
+    for b in bins:
+        by_line.setdefault(b.line, []).append(b)
+    out_parts: list[str] = []
+    for ln, bs in by_line.items():
+        n = sum(b.count for b in bs)
+        if n == 0:
+            continue
+        bs_sorted = sorted(bs, key=lambda b: b.bin_lower)
+        nb = len(bs_sorted)
+        cutoff_low = max(1, nb // 5)
+        cutoff_high = nb - cutoff_low
+        left = sum(b.count for b in bs_sorted[:cutoff_low])
+        middle = sum(b.count for b in bs_sorted[cutoff_low:cutoff_high])
+        right = sum(b.count for b in bs_sorted[cutoff_high:])
+        left_share = left / n
+        middle_share = middle / n
+        right_share = right / n
+        expected_tail = cutoff_low / nb  # what each tail share would be under uniform
+        expected_mid = (cutoff_high - cutoff_low) / nb
+        # Heuristics with a 20% slack around uniform expectation.
+        if abs(left_share - expected_tail) < 0.05 and abs(right_share - expected_tail) < 0.05:
+            label = "calibrated (flat)"
+        elif left_share + right_share > expected_tail * 2 * 1.4:
+            label = "U-shape — intervals too tight (under-dispersed)"
+        elif middle_share > expected_mid * 1.4:
+            label = "∩-shape — intervals too wide (over-dispersed)"
+        elif right_share > expected_tail * 1.6 and left_share < expected_tail:
+            label = "right-skew — actuals slower than predicted"
+        elif left_share > expected_tail * 1.6 and right_share < expected_tail:
+            label = "left-skew — actuals faster than predicted"
+        else:
+            label = "mixed shape"
+        out_parts.append(f"{ln}: {label} (n={n})")
+    return " · ".join(out_parts)
+
+
 def calibration_bins(
     conn: duckdb.DuckDBPyConnection,
     *,

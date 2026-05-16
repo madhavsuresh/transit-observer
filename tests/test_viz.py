@@ -67,12 +67,18 @@ def test_coverage_heatmap_handles_empty():
     assert spec  # produces *some* valid spec, not a crash
 
 
-def test_reliability_diagram_returns_chart_and_includes_reference_line():
+def test_reliability_diagram_default_is_overlaid():
+    """Default mode overlays lines into one chart for easy comparison."""
     chart = reliability_diagram_chart(_reliability_fixture())
     spec = chart.to_dict()
-    # Layered chart with line + points + diagonal reference.
-    serialized = str(spec)
-    assert "facet" in serialized or "spec" in serialized
+    # Default is not faceted; should be a layered chart.
+    assert "facet" not in spec
+
+
+def test_reliability_diagram_facet_mode_produces_facets():
+    chart = reliability_diagram_chart(_reliability_fixture(), facet=True)
+    spec = chart.to_dict()
+    assert "facet" in spec
 
 
 def test_reliability_diagram_handles_empty():
@@ -80,17 +86,29 @@ def test_reliability_diagram_handles_empty():
     assert chart.to_dict() is not None
 
 
-def test_pit_histogram_returns_chart():
+def test_pit_histogram_default_is_overlaid():
     chart = pit_histogram_chart(_pit_fixture())
     spec = chart.to_dict()
-    assert spec
-    # Reference line at density=1.0 (uniform expectation) should be present.
-    assert "1" in str(spec)
+    # Default is not faceted; should be one overlaid chart.
+    assert "facet" not in spec
+
+
+def test_pit_histogram_facet_mode_produces_facets():
+    chart = pit_histogram_chart(_pit_fixture(), facet=True)
+    spec = chart.to_dict()
+    assert "facet" in spec
 
 
 def test_pit_histogram_handles_empty():
     chart = pit_histogram_chart(pd.DataFrame())
     assert chart.to_dict() is not None
+
+
+def test_pit_histogram_uniform_reference_present():
+    """Uniform density (=1.0) reference line should be in the spec."""
+    chart = pit_histogram_chart(_pit_fixture())
+    spec_str = str(chart.to_dict())
+    assert "uniform" in spec_str.lower() or "1.0" in spec_str
 
 
 def test_sharpness_coverage_returns_chart():

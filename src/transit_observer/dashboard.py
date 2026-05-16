@@ -21,8 +21,14 @@ from transit_observer.direction_audit import audit_summary
 from transit_observer.metrics import (
     corpus_summary,
     corridor_coverage,
+    diagnose_pit_shape,
+    historical_prediction,
+    live_data_diagnostic,
+    per_line_resolved_counts,
     pit_histogram,
+    pit_histogram_aggregated,
     reliability_curve,
+    reliability_curve_aggregated,
     status,
 )
 from transit_observer.viz import (
@@ -163,11 +169,16 @@ def _residual_df(window_hours: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
-def _reliability_df(min_samples: int) -> pd.DataFrame:
+def _reliability_df(min_samples: int, mode: str = "per_line") -> pd.DataFrame:
+    """``mode`` = 'per_line' (split by line, min_samples gate applied) or
+    'aggregated' (all data combined under line='ALL')."""
     if not _db_ready():
         return pd.DataFrame()
     with db.reader() as conn:
-        rows = reliability_curve(conn, min_samples=min_samples)
+        if mode == "aggregated":
+            rows = reliability_curve_aggregated(conn)
+        else:
+            rows = reliability_curve(conn, min_samples=min_samples)
     return pd.DataFrame(
         [
             {
@@ -182,11 +193,14 @@ def _reliability_df(min_samples: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
-def _pit_df(min_samples: int, n_bins: int) -> pd.DataFrame:
+def _pit_df(min_samples: int, n_bins: int, mode: str = "per_line") -> pd.DataFrame:
     if not _db_ready():
         return pd.DataFrame()
     with db.reader() as conn:
-        rows = pit_histogram(conn, n_bins=n_bins, min_samples=min_samples)
+        if mode == "aggregated":
+            rows = pit_histogram_aggregated(conn, n_bins=n_bins)
+        else:
+            rows = pit_histogram(conn, n_bins=n_bins, min_samples=min_samples)
     return pd.DataFrame(
         [
             {
@@ -201,8 +215,35 @@ def _pit_df(min_samples: int, n_bins: int) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=30)
+def _line_counts_df() -> pd.DataFrame:
+    """Per (mode, line) breakdown of resolved-forecast counts — lets the
+    user see which lines have enough data to show up in PIT/reliability."""
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        rows = per_line_resolved_counts(conn)
+    return pd.DataFrame(
+        [
+            {
+                "mode": r.mode,
+                "line": r.line,
+                "n_resolved": r.n_resolved,
+                "n_high_conf": r.n_resolved_high_conf,
+            }
+            for r in rows
+        ]
+    )
+
+
 def _render_live_forecast_tab() -> None:
-    """Interactive: pick a seeded corridor, run the predictor, dotplot it."""
+    """Interactive: pick a seeded corridor, predict, dotplot.
+
+    Tries the live kernel first. Falls back to an *empirical* prediction
+    drawn from past resolved forecasts for the same OD pair if the live
+    feed lacks data. Always shows a diagnostic so the user understands
+    which path was taken and why.
+    """
     options = {
         f"{c.mode} · {c.line} · {c.origin_label} → {c.destination_label}": c
         for c in SEED_CORRIDORS
@@ -210,64 +251,140 @@ def _render_live_forecast_tab() -> None:
     if not options:
         st.info("No seeded corridors available.")
         return
+
     label = st.selectbox("Corridor", list(options.keys()), key="live_forecast_corridor")
     corridor = options[label]
+    source_pref = st.radio(
+        "Source",
+        ("auto: live → historical fallback", "live only", "historical only"),
+        horizontal=True, key="live_forecast_source",
+    )
     if not st.button("Predict", key="live_forecast_predict"):
         st.caption(
-            "Click Predict to run the live kernel against the read replica "
-            "and render a 50-dot quantile dotplot. Each dot ≈ 2% probability."
+            "Each dot ≈ 2% probability. Read 'will I arrive in ≤ T?' by "
+            "counting dots to the left of T. Auto mode tries the live "
+            "kernel first; historical falls back to past resolved trips "
+            "for this exact OD when the live feed is sparse."
         )
         return
 
     now = datetime.now(CHICAGO)
-    try:
+    p50, p80, p90, source_label, n_samples = (None, None, None, None, None)
+    diagnostic = None
+
+    if source_pref != "historical only":
+        try:
+            with db.reader() as conn:
+                live = predict_for_od(
+                    conn,
+                    mode=corridor.mode, line=corridor.line,
+                    boarding_int_id=corridor.boarding_int_id,
+                    boarding_text_id=corridor.boarding_text_id,
+                    alighting_int_id=corridor.alighting_int_id,
+                    alighting_text_id=corridor.alighting_text_id,
+                    now=now,
+                )
+                diagnostic = live_data_diagnostic(
+                    conn,
+                    mode=corridor.mode, line=corridor.line,
+                    boarding_int_id=corridor.boarding_int_id,
+                    boarding_text_id=corridor.boarding_text_id,
+                    now=now,
+                )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Live predictor raised: {type(exc).__name__}: {exc}")
+            live = None
+        if live is not None and live.predicted_total_p80 > live.predicted_total_p50 > 0:
+            p50, p80, p90 = (
+                live.predicted_total_p50,
+                live.predicted_total_p80,
+                live.predicted_total_p90,
+            )
+            source_label = "live"
+
+    if (p50 is None or p80 is None) and source_pref != "live only":
         with db.reader() as conn:
-            prediction = predict_for_od(
+            hist = historical_prediction(
                 conn,
                 mode=corridor.mode, line=corridor.line,
                 boarding_int_id=corridor.boarding_int_id,
                 boarding_text_id=corridor.boarding_text_id,
                 alighting_int_id=corridor.alighting_int_id,
                 alighting_text_id=corridor.alighting_text_id,
-                now=now,
             )
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Predictor failed: {type(exc).__name__}: {exc}")
-        return
+        if hist is not None and hist.p80_seconds > hist.p50_seconds:
+            p50, p80, p90 = hist.p50_seconds, hist.p80_seconds, hist.p90_seconds
+            source_label = "historical (empirical)"
+            n_samples = hist.n_samples
 
-    if prediction is None:
+    if p50 is None or p80 is None:
         st.warning(
-            "No prediction available right now — the per-mode predictor "
-            "lacked recent data (e.g. no upcoming arrivals at the boarding stop)."
+            "Couldn't produce a prediction from either source. "
+            "Live feed has no upcoming arrivals at the boarding stop, and "
+            "fewer than 5 past trips have been resolved for this OD pair."
+        )
+        if diagnostic is not None:
+            cols = st.columns(3)
+            cols[0].metric(
+                "raw rows (live window)", str(diagnostic.raw_rows_in_window),
+                help="arrivals at boarding stop seen in last 5 min + 30-min future window",
+            )
+            cols[1].metric(
+                "future-window rows", str(diagnostic.future_rows),
+                help="subset where arrival_at >= now",
+            )
+            last = diagnostic.last_raw_polled_at
+            cols[2].metric(
+                "last polled", last.strftime("%H:%M:%S") if last else "—",
+                help="latest polled_at for this stop in the live window",
+            )
+        st.caption(
+            "Try a different corridor, or wait for the collector to "
+            "accumulate more arrivals at this boarding stop."
         )
         return
 
-    p50 = prediction.predicted_total_p50
-    p80 = prediction.predicted_total_p80
-    p90 = prediction.predicted_total_p90
-    if not (p50 > 0 and p80 > p50):
-        st.warning(
-            f"Predictor returned a degenerate quantile triple "
-            f"(p50={p50:.0f}s, p80={p80:.0f}s) — cannot fit a distribution."
-        )
-        return
+    cols = st.columns(4)
+    cols[0].metric("p50 (min)", f"{p50 / 60:.1f}")
+    cols[1].metric("p80 (min)", f"{p80 / 60:.1f}")
+    cols[2].metric("p90 (min)", f"{(p90 or p80) / 60:.1f}")
+    if n_samples is not None:
+        cols[3].metric("n past trips", str(n_samples))
+    else:
+        cols[3].metric("source", source_label or "?")
 
-    cols = st.columns(3)
-    cols[0].metric("p50 (minutes)", f"{p50 / 60:.1f}")
-    cols[1].metric("p80 (minutes)", f"{p80 / 60:.1f}")
-    cols[2].metric("p90 (minutes)", f"{p90 / 60:.1f}")
+    badge = "🟢 live forecast" if source_label == "live" else "🟡 historical fallback"
+    st.markdown(f"**{badge}** · `{corridor.line}` · {corridor.origin_label} → {corridor.destination_label}")
+
     st.altair_chart(
         quantile_dotplot_chart(
             p50, p80,
-            title=f"{corridor.line}: {corridor.origin_label} → {corridor.destination_label}",
+            title=f"{source_label}: each dot ≈ 2% probability",
         ),
         use_container_width=True,
     )
-    st.caption(
-        "Fitted log-normal to (p50, p80). Each dot is one of 50 evenly-spaced "
-        "quantiles ⇒ ≈ 2% probability mass per dot. Count dots ≤ a target "
-        "duration to read off Pr(arrival within that time)."
-    )
+
+    if source_label == "live":
+        st.caption(
+            "Live kernel fitted a log-normal to (p50, p80). 50 dots, "
+            "each ≈ 2% probability mass. Count dots to the left of any "
+            "target minute to read Pr(arrival within that time)."
+        )
+        if diagnostic is not None and diagnostic.raw_rows_in_window > 0:
+            st.caption(
+                f"Diagnostic: {diagnostic.raw_rows_in_window} raw rows at "
+                f"boarding stop in live window ({diagnostic.future_rows} in future). "
+                f"Last polled at "
+                f"{diagnostic.last_raw_polled_at.strftime('%H:%M:%S') if diagnostic.last_raw_polled_at else '?'}."
+            )
+    else:
+        st.caption(
+            f"Historical fallback: empirical p50/p80/p90 from the most "
+            f"recent {n_samples} resolved trips on this OD pair. The "
+            f"log-normal fit and 50-dot encoding are identical to the "
+            f"live case — but the underlying distribution is past outcomes, "
+            f"not a live arrivals snapshot."
+        )
 
 
 def _render() -> None:
@@ -315,8 +432,34 @@ def _render() -> None:
         "Diagnostic views recommended by the transit-uncertainty literature "
         "(Kay et al., CHI 2016 / 2018) and standard forecast-verification "
         "practice. PIT and reliability assume a log-normal fit through "
-        "(p50, p80); see the project README for the rationale."
+        "(p50, p80); see CALIBRATION_VIZ_DESIGN.md for rationale."
     )
+
+    line_counts = _line_counts_df()
+    if line_counts.empty:
+        st.info(
+            "No resolved forecasts yet. Let the collector run until trips "
+            "are resolved (typically takes >30 min after the first prediction)."
+        )
+    else:
+        with st.expander(
+            f"Data inventory · {int(line_counts['n_resolved'].sum())} resolved forecasts "
+            f"across {len(line_counts)} (mode, line) pairs",
+            expanded=False,
+        ):
+            st.dataframe(
+                line_counts.rename(columns={
+                    "n_resolved": "resolved",
+                    "n_high_conf": "high-conf (used by PIT/reliability)",
+                }),
+                hide_index=True, use_container_width=True,
+            )
+            st.caption(
+                "PIT and reliability filter to truth_confidence ≥ 0.5. "
+                "Per-line views require ≥30 high-confidence samples; "
+                "aggregated views require ≥1."
+            )
+
     tabs = st.tabs([
         "Reliability",
         "PIT shape",
@@ -325,34 +468,78 @@ def _render() -> None:
         "Live forecast",
     ])
     with tabs[0]:
-        reliability = _reliability_df(min_samples=max(min_samples, 30))
-        if reliability.empty:
+        view = st.radio(
+            "View",
+            ("aggregated (all lines)", "per line (≥30 samples)"),
+            horizontal=True, key="reliability_view",
+        )
+        if view.startswith("aggregated"):
+            df = _reliability_df(min_samples=1, mode="aggregated")
+        else:
+            df = _reliability_df(min_samples=30, mode="per_line")
+        if df.empty:
             st.info(
-                "Need ≥30 resolved forecasts per line to draw a stable "
-                "reliability curve. Keep the collector running."
+                "No data for this view yet. Try 'aggregated' for the "
+                "broadest pool, or wait for more resolved forecasts."
             )
         else:
             st.altair_chart(
-                reliability_diagram_chart(reliability),
+                reliability_diagram_chart(df, facet=view.startswith("per line")),
+                use_container_width=True,
+            )
+            n_total = int(df.groupby("line")["n"].first().sum())
+            st.caption(
+                f"x = the *claimed* probability (e.g. p80 → 0.80). y = the "
+                f"empirical fraction of actuals that landed below the fitted "
+                f"q-quantile. Dashed line = perfect calibration. "
+                f"Pool: {n_total} samples across "
+                f"{df['line'].nunique()} line(s)."
+            )
+    with tabs[1]:
+        view = st.radio(
+            "View",
+            ("aggregated (all lines)", "per line (≥30 samples)"),
+            horizontal=True, key="pit_view",
+        )
+        n_bins = st.slider(
+            "PIT bins", min_value=5, max_value=40, value=20, step=5, key="pit_bins",
+        )
+        if view.startswith("aggregated"):
+            pit = _pit_df(min_samples=1, n_bins=n_bins, mode="aggregated")
+        else:
+            pit = _pit_df(min_samples=30, n_bins=n_bins, mode="per_line")
+        if pit.empty:
+            st.info(
+                "No data for this view. Try 'aggregated' first; the "
+                "per-line view needs ≥30 high-confidence samples per line."
+            )
+        else:
+            from transit_observer.metrics import PitBin as _PitBin  # local import for type
+            # Reconstruct PitBin records for the textual diagnosis.
+            bins = [
+                _PitBin(
+                    line=r["line"], bin_lower=r["bin_lower"],
+                    bin_upper=r["bin_upper"], count=int(r["count"]),
+                    density=float(r["density"]),
+                )
+                for r in pit.to_dict("records")
+            ]
+            diagnosis = diagnose_pit_shape(bins)
+            n_total = int(pit["count"].sum())
+            st.markdown(f"**Diagnosis** — {diagnosis}")
+            st.altair_chart(
+                pit_histogram_chart(pit, facet=view.startswith("per line")),
                 use_container_width=True,
             )
             st.caption(
-                "Each point: at the nominal quantile q (x), the fraction of "
-                "actuals that fell below the fitted q-quantile (y). Dashed "
-                "y=x line is perfect calibration. Above ⇒ predictions too "
-                "pessimistic; below ⇒ too optimistic."
-            )
-    with tabs[1]:
-        pit = _pit_df(min_samples=max(min_samples, 30), n_bins=20)
-        if pit.empty:
-            st.info("Need ≥30 resolved forecasts per line to draw a PIT histogram.")
-        else:
-            st.altair_chart(pit_histogram_chart(pit), use_container_width=True)
-            st.caption(
-                "Histogram of PIT = F_predicted(actual). "
-                "Flat ⇒ calibrated. U-shape ⇒ intervals too tight. "
-                "∩-shape ⇒ too wide. Left-skew ⇒ actuals slower than predicted. "
-                "Right-skew ⇒ actuals faster than predicted."
+                f"PIT = F(actual) under the fitted log-normal forecast. "
+                f"Each bar's height is *density* — a calibrated kernel "
+                f"produces density ≈ 1.0 (dashed line) across all bins. "
+                f"Mass on the left ⇒ actuals were faster than predicted; "
+                f"mass on the right ⇒ slower; piled in the middle ⇒ "
+                f"intervals too wide; piled in both tails ⇒ too tight. "
+                f"Pool: {n_total} samples across "
+                f"{pit['line'].nunique()} line(s)."
             )
     with tabs[2]:
         if coverage.empty:
@@ -360,9 +547,10 @@ def _render() -> None:
         else:
             st.altair_chart(coverage_heatmap_chart(coverage), use_container_width=True)
             st.caption(
-                "p80 coverage minus target (0.80). Red ⇒ overconfident "
-                "(intervals too tight); blue ⇒ underconfident (intervals too "
-                "wide); white ⇒ on target."
+                "Each cell: the bucket's empirical p80 coverage, labelled "
+                "as a percentage. Color: deviation from the 80% target "
+                "(white = on target). Red cells are overconfident "
+                "(intervals too tight); blue are underconfident."
             )
     with tabs[3]:
         if coverage.empty:
@@ -373,9 +561,11 @@ def _render() -> None:
                 use_container_width=True,
             )
             st.caption(
-                "Lower-right is the worst quadrant: confident *and* wrong. "
-                "Aim for points clustered near the dashed line at y=0.8 with "
-                "low sharpness (tight intervals)."
+                "Each dot is one (line, direction, hour, weekday|weekend) "
+                "bucket. The top-left quadrant is the target zone: tight "
+                "intervals (low sharpness, x-axis) that still hit 80% "
+                "coverage (y-axis). The bottom half is biased; the right "
+                "half is loose."
             )
     with tabs[4]:
         _render_live_forecast_tab()

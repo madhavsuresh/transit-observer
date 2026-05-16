@@ -29,18 +29,20 @@ from .journey.quantile_distribution import quantile_dotplot_positions
 
 
 def coverage_heatmap_chart(coverage_df: pd.DataFrame) -> alt.Chart:
-    """Heatmap of `coverage_p80 − 0.80` faceted by (line, direction).
+    """Heatmap of `coverage_p80 − 0.80` faceted by line.
 
     Diverging colour: blue = underconfident (intervals too wide),
-    red = overconfident (intervals too tight), white = on target.
+    red = overconfident (intervals too tight), white = on target (0.80).
+    Each cell carries its sample count as a text annotation.
     """
     if coverage_df.empty:
         return alt.Chart(pd.DataFrame({"msg": ["no data"]})).mark_text().encode()
 
     df = coverage_df.copy()
     df["coverage_delta"] = df["coverage_p80"] - 0.8
+    df["coverage_pct"] = (df["coverage_p80"] * 100).round().astype(int).astype(str) + "%"
 
-    cell = (
+    rect = (
         alt.Chart()
         .mark_rect()
         .encode(
@@ -48,8 +50,9 @@ def coverage_heatmap_chart(coverage_df: pd.DataFrame) -> alt.Chart:
             y=alt.Y("weekday:N", title=None),
             color=alt.Color(
                 "coverage_delta:Q",
-                title="p80 − target",
+                title="p80 coverage − 0.80",
                 scale=alt.Scale(scheme="redblue", domain=[-0.3, 0.3], reverse=True),
+                legend=alt.Legend(format=".0%"),
             ),
             tooltip=[
                 alt.Tooltip("line:N"),
@@ -62,28 +65,43 @@ def coverage_heatmap_chart(coverage_df: pd.DataFrame) -> alt.Chart:
                 alt.Tooltip("median_sharpness_s:Q", title="sharpness (s)", format=".0f"),
             ],
         )
-        .properties(width=320, height=80)
     )
-    return cell.facet(
-        facet=alt.Facet("line:N", title=None),
+    text = (
+        alt.Chart()
+        .mark_text(fontSize=10, color="black")
+        .encode(
+            x=alt.X("hour_of_day:O"),
+            y=alt.Y("weekday:N"),
+            text=alt.Text("coverage_pct:N"),
+        )
+    )
+    layered = alt.layer(rect, text).properties(width=320, height=80)
+    return layered.facet(
+        facet=alt.Facet("line:N", title="Line — cells show p80 coverage; target is 80% (white)"),
         columns=2,
         data=df,
     )
 
 
-def reliability_diagram_chart(reliability_df: pd.DataFrame) -> alt.Chart:
-    """Reliability diagram: empirical coverage vs nominal quantile, per line.
+def reliability_diagram_chart(
+    reliability_df: pd.DataFrame, *, facet: bool = False,
+) -> alt.Chart:
+    """Reliability diagram: empirical coverage vs claimed probability.
 
-    Perfect calibration plots on y=x (rendered as a dashed reference).
-    Above diagonal = predictions too pessimistic.
-    Below diagonal = predictions too optimistic.
+    By default plots one chart with all lines overlaid (colored, with
+    a legend) so the user can compare lines at a glance. Pass
+    ``facet=True`` for one panel per line — useful when there are many
+    lines.
+
+    The diagonal is `y = x`: predictions claiming probability q match
+    reality if exactly q-fraction of actuals fell at or below the
+    claimed q-quantile. Above the diagonal = predictions too
+    pessimistic (intervals wider than needed); below = too optimistic
+    (intervals too tight).
     """
     if reliability_df.empty:
         return alt.Chart(pd.DataFrame({"msg": ["no data"]})).mark_text().encode()
 
-    # Add the y=x reference to the dataframe as two extra rows per line so
-    # the diagonal lives on the same data source as the points (faceting
-    # layered charts requires a single shared dataset).
     df = reliability_df.copy()
     df["reference"] = df["nominal_quantile"]
 
@@ -96,100 +114,162 @@ def reliability_diagram_chart(reliability_df: pd.DataFrame) -> alt.Chart:
         )
     )
 
-    points = (
+    line_mark = (
         alt.Chart()
-        .mark_circle(size=80)
+        .mark_line(strokeWidth=2)
         .encode(
             x=alt.X(
                 "nominal_quantile:Q",
-                title="nominal quantile",
+                title="claimed probability (e.g. p80 → 0.80)",
                 scale=alt.Scale(domain=[0, 1]),
             ),
             y=alt.Y(
                 "empirical_coverage:Q",
-                title="empirical coverage",
+                title="fraction of actuals that fell below the q-quantile",
                 scale=alt.Scale(domain=[0, 1]),
             ),
+            color=alt.Color(
+                "line:N",
+                title="line",
+                legend=alt.Legend(orient="right"),
+            ),
+        )
+    )
+
+    points = (
+        alt.Chart()
+        .mark_circle(size=80)
+        .encode(
+            x=alt.X("nominal_quantile:Q"),
+            y=alt.Y("empirical_coverage:Q"),
             color=alt.Color("line:N", legend=None),
             tooltip=[
                 alt.Tooltip("line:N"),
-                alt.Tooltip("nominal_quantile:Q", format=".0%"),
-                alt.Tooltip("empirical_coverage:Q", format=".1%"),
-                alt.Tooltip("n:Q"),
+                alt.Tooltip("nominal_quantile:Q", title="claimed", format=".0%"),
+                alt.Tooltip("empirical_coverage:Q", title="observed", format=".1%"),
+                alt.Tooltip("n:Q", title="n samples"),
             ],
         )
     )
 
-    line = (
-        alt.Chart()
-        .mark_line()
-        .encode(
-            x="nominal_quantile:Q",
-            y="empirical_coverage:Q",
-            color=alt.Color("line:N", legend=None),
+    # Annotations: "above diagonal = pessimistic", "below = optimistic"
+    annotations = pd.DataFrame([
+        {"x": 0.25, "y": 0.65, "label": "above: too pessimistic"},
+        {"x": 0.7, "y": 0.3, "label": "below: too optimistic"},
+    ])
+    notes = (
+        alt.Chart(annotations)
+        .mark_text(color="#999", fontSize=10, fontStyle="italic")
+        .encode(x="x:Q", y="y:Q", text="label:N")
+    )
+
+    if facet:
+        layered = alt.layer(diag, line_mark, points).properties(width=240, height=240)
+        return layered.facet(
+            facet=alt.Facet("line:N", title=None),
+            columns=4,
+            data=df,
         )
-    )
-
-    layered = alt.layer(diag, line, points).properties(width=240, height=240)
-    return layered.facet(
-        facet=alt.Facet("line:N", title=None),
-        columns=4,
-        data=df,
+    return (
+        (alt.layer(diag, notes, line_mark, points, data=df))
+        .properties(width=480, height=360)
     )
 
 
-def pit_histogram_chart(pit_df: pd.DataFrame) -> alt.Chart:
-    """Histogram of PIT values per line, with the uniform-density reference.
+def pit_histogram_chart(pit_df: pd.DataFrame, *, facet: bool = False) -> alt.Chart:
+    """PIT histogram with a uniform-density reference and shape annotations.
 
-    Uniform shape ⇒ calibrated. U-shape ⇒ intervals too tight.
-    ∩-shape ⇒ intervals too wide. Skew ⇒ central-tendency bias.
+    PIT = F_predicted(actual). For a calibrated kernel, PITs are uniform
+    on [0, 1] so the histogram is flat at density = 1. Deviations
+    diagnose the kind of miscalibration:
+
+    - Mass piled in the **middle** ⇒ intervals too wide (over-dispersed).
+    - Mass piled in **both tails** (U-shape) ⇒ intervals too tight
+      (under-dispersed).
+    - Mass piled on the **left** (low PIT) ⇒ actuals faster than predicted.
+    - Mass piled on the **right** (high PIT) ⇒ actuals slower than predicted.
+
+    By default produces one chart across all lines (the simplest read);
+    pass ``facet=True`` to break out one panel per line.
     """
     if pit_df.empty:
         return alt.Chart(pd.DataFrame({"msg": ["no data"]})).mark_text().encode()
 
     df = pit_df.copy()
     df["uniform"] = 1.0
+    # Width in axis units; bars need this when binning is pre-computed.
+    df["bin_mid"] = (df["bin_lower"] + df["bin_upper"]) / 2
 
     bars = (
         alt.Chart()
-        .mark_bar()
+        .mark_bar(opacity=0.85)
         .encode(
-            x=alt.X("bin_lower:Q", title="PIT bin", scale=alt.Scale(domain=[0, 1])),
+            x=alt.X(
+                "bin_lower:Q",
+                title="PIT = F_forecast(actual)  →  0 = fast, 1 = slow",
+                scale=alt.Scale(domain=[0, 1]),
+            ),
             x2="bin_upper:Q",
-            y=alt.Y("density:Q", title="density"),
-            color=alt.Color("line:N", legend=None),
+            y=alt.Y(
+                "density:Q",
+                title="density (1.0 = uniform / calibrated)",
+            ),
+            color=alt.Color(
+                "line:N", title="line",
+                legend=alt.Legend(orient="right") if not facet else None,
+            ),
             tooltip=[
                 alt.Tooltip("line:N"),
-                alt.Tooltip("bin_lower:Q", format=".2f"),
-                alt.Tooltip("bin_upper:Q", format=".2f"),
+                alt.Tooltip("bin_lower:Q", title="bin start", format=".2f"),
+                alt.Tooltip("bin_upper:Q", title="bin end", format=".2f"),
                 alt.Tooltip("count:Q"),
-                alt.Tooltip("density:Q", format=".2f"),
+                alt.Tooltip("density:Q", title="density", format=".2f"),
             ],
         )
     )
 
     uniform = (
         alt.Chart()
-        .mark_rule(strokeDash=[4, 4], color="gray")
+        .mark_rule(strokeDash=[4, 4], color="black", strokeWidth=1.5)
         .encode(y="uniform:Q")
     )
 
-    layered = alt.layer(bars, uniform).properties(width=240, height=200)
-    return layered.facet(
-        facet=alt.Facet("line:N", title=None),
-        columns=4,
-        data=df,
+    # Inline annotation marks calling out the diagnostic vocabulary.
+    notes = pd.DataFrame([
+        {"x": 0.08, "y": 1.6, "label": "← actuals faster"},
+        {"x": 0.92, "y": 1.6, "label": "actuals slower →"},
+    ])
+    note_marks = (
+        alt.Chart(notes)
+        .mark_text(color="#888", fontSize=10, fontStyle="italic")
+        .encode(x="x:Q", y="y:Q", text="label:N")
+    )
+
+    if facet:
+        layered = alt.layer(bars, uniform).properties(width=240, height=200)
+        return layered.facet(
+            facet=alt.Facet("line:N", title="Per-line PIT shape — flat ribbon = calibrated"),
+            columns=4,
+            data=df,
+        )
+
+    return (
+        alt.layer(bars, uniform, note_marks, data=df)
+        .properties(width=480, height=320)
     )
 
 
 def sharpness_coverage_chart(coverage_df: pd.DataFrame) -> alt.Chart:
     """Scatter of (median sharpness, p80 coverage), one point per bucket.
 
-    Target zone: low x, y ≈ 0.80. Lower-right (sharp but miscalibrated)
-    is the worst quadrant: confident *and* wrong.
+    Target zone: low x, y ≈ 0.80 (tight intervals that still hit the
+    mark). The chart annotates each quadrant so the maintainer can
+    interpret at a glance.
     """
     if coverage_df.empty:
         return alt.Chart(pd.DataFrame({"msg": ["no data"]})).mark_text().encode()
+
+    df = coverage_df.copy()
 
     reference = (
         alt.Chart(pd.DataFrame({"y": [0.8]}))
@@ -198,13 +278,16 @@ def sharpness_coverage_chart(coverage_df: pd.DataFrame) -> alt.Chart:
     )
 
     points = (
-        alt.Chart(coverage_df)
-        .mark_circle(opacity=0.7)
+        alt.Chart(df)
+        .mark_circle(opacity=0.65)
         .encode(
-            x=alt.X("median_sharpness_s:Q", title="median sharpness (s) — lower is tighter"),
+            x=alt.X(
+                "median_sharpness_s:Q",
+                title="median (p80 − p50) seconds — lower is tighter / more confident",
+            ),
             y=alt.Y(
                 "coverage_p80:Q",
-                title="p80 coverage",
+                title="empirical p80 coverage (target = 0.80)",
                 scale=alt.Scale(domain=[0, 1]),
             ),
             size=alt.Size("n_samples:Q", title="n samples"),
@@ -212,13 +295,27 @@ def sharpness_coverage_chart(coverage_df: pd.DataFrame) -> alt.Chart:
             tooltip=[
                 "line:N", "direction:N", "hour_of_day:O", "weekday:N",
                 "n_samples:Q",
-                alt.Tooltip("coverage_p80:Q", format=".1%"),
-                alt.Tooltip("median_sharpness_s:Q", format=".0f"),
+                alt.Tooltip("coverage_p80:Q", title="p80", format=".1%"),
+                alt.Tooltip("median_sharpness_s:Q", title="sharpness (s)", format=".0f"),
             ],
         )
     )
 
-    return (reference + points).properties(height=360)
+    # Quadrant labels — positioned in screen quadrants of the chart.
+    x_max = max(df["median_sharpness_s"].max(), 1.0)
+    annotations = pd.DataFrame([
+        {"x": x_max * 0.08, "y": 0.83, "label": "✓ target: tight & calibrated"},
+        {"x": x_max * 0.08, "y": 0.55, "label": "⚠ tight but biased: overconfident"},
+        {"x": x_max * 0.75, "y": 0.83, "label": "ok: loose but calibrated"},
+        {"x": x_max * 0.75, "y": 0.55, "label": "⚠ loose and biased"},
+    ])
+    notes = (
+        alt.Chart(annotations)
+        .mark_text(color="#666", fontSize=10, fontStyle="italic", align="left")
+        .encode(x="x:Q", y="y:Q", text="label:N")
+    )
+
+    return (reference + notes + points).properties(height=420)
 
 
 # --- User-facing single-prediction display -------------------------------
