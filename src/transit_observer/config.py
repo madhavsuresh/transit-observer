@@ -45,16 +45,40 @@ class Settings:
     )
     monitored_bus_stops: tuple[tuple[str, int], ...] = field(
         default_factory=lambda: (
-            ("22", 1106),    # Clark — Belmont (NB)
-            ("22", 1107),    # Clark — Belmont (SB)
-            ("66", 4519),    # Chicago — State (EB)
-            ("66", 4540),    # Chicago — State (WB)
+            # General-coverage stops (not tied to any corridor; kept for
+            # raw data collection across high-ridership routes).
             ("147", 12550),  # Outer Drive Express
-            ("151", 1928),   # Sheridan — Belmont
-            ("9", 8089),     # Ashland — Madison
+            ("151", 1928),   # Sheridan & Belmont
+            ("9", 8089),     # Ashland & Madison
             ("X9", 8089),
             ("J14", 17131),  # Jeffery Jump
             ("3", 8056),     # King Drive
+            ("66", 4519),    # Chicago & State (EB)
+            ("66", 4540),    # Chicago & State (WB)
+
+            # Route 22 (Clark) corridor stops -- both directions, both ends.
+            ("22", 1828),    # Clark & Belmont (SB)
+            ("22", 1921),    # Clark & Belmont (NB)
+            ("22", 1869),    # Clark & Adams (SB)
+            ("22", 14767),   # Dearborn & Grand (NB)
+
+            # Route 66 (Chicago Ave) corridor: Michigan <-> Western.
+            ("66", 599),     # Chicago & Michigan (WB)
+            ("66", 580),     # Chicago & Michigan (EB)
+            ("66", 15203),   # Chicago & Western (WB)
+            ("66", 548),     # Chicago & Western (EB)
+
+            # Route 9 (Ashland) corridor: Belmont <-> 87th.
+            ("9", 6003),     # Ashland & Belmont (SB)
+            ("9", 6272),     # Ashland & Belmont (NB)
+            ("9", 6155),     # Ashland & 87th (NB)
+            ("9", 15249),    # Ashland & 87th (SB)
+
+            # Route 79 (79th St) corridor: Halsted <-> Stony Island.
+            ("79", 2762),    # 79th & Halsted (EB)
+            ("79", 17349),   # 79th & Halsted (WB)
+            ("79", 2795),    # 79th & Stony Island (EB)
+            ("79", 2621),    # 79th & Stony Island (WB)
         )
     )
 
