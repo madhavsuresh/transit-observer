@@ -98,6 +98,57 @@ CREATE TABLE IF NOT EXISTS forecast_queue (
 
 CREATE INDEX IF NOT EXISTS idx_forecast_status_resolve ON forecast_queue(status, resolve_after);
 
+CREATE TABLE IF NOT EXISTS metra_arrivals_raw (
+    polled_at              TIMESTAMPTZ NOT NULL,
+    route_id               TEXT NOT NULL,
+    trip_id                TEXT NOT NULL,
+    station_id             TEXT NOT NULL,
+    direction_id           INTEGER,
+    schedule_relationship  TEXT,
+    scheduled_at           TIMESTAMPTZ,
+    predicted_at           TIMESTAMPTZ,
+    delay_seconds          INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_metra_polled ON metra_arrivals_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_metra_route_station ON metra_arrivals_raw(route_id, station_id);
+
+CREATE TABLE IF NOT EXISTS intercampus_arrivals_raw (
+    polled_at         TIMESTAMPTZ NOT NULL,
+    route_id          TEXT NOT NULL,
+    trip_id           TEXT NOT NULL,
+    direction         TEXT,
+    stop_id           TEXT NOT NULL,
+    stop_name         TEXT,
+    destination_name  TEXT,
+    predicted_at      TIMESTAMPTZ,
+    arrival_at        TIMESTAMPTZ,
+    delay_seconds     INTEGER,
+    is_delayed        BOOLEAN,
+    time_source       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_intercampus_polled ON intercampus_arrivals_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_intercampus_stop ON intercampus_arrivals_raw(direction, stop_id);
+
+CREATE TABLE IF NOT EXISTS bus_predictions_raw (
+    polled_at          TIMESTAMPTZ NOT NULL,
+    route              TEXT NOT NULL,
+    route_name         TEXT,
+    vehicle_id         TEXT,
+    stop_id            INTEGER NOT NULL,
+    stop_name          TEXT,
+    destination_name   TEXT,
+    direction_name     TEXT,
+    generated_at       TIMESTAMPTZ,
+    arrival_at         TIMESTAMPTZ,
+    is_delayed         BOOLEAN,
+    is_approaching     BOOLEAN
+);
+
+CREATE INDEX IF NOT EXISTS idx_bus_polled ON bus_predictions_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_bus_route_stop ON bus_predictions_raw(route, stop_id);
+
 CREATE TABLE IF NOT EXISTS direction_audit (
     forecast_id                       TEXT PRIMARY KEY,
     audited_at                        TIMESTAMPTZ NOT NULL,

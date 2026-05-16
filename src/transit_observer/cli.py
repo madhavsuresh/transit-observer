@@ -20,11 +20,18 @@ def status_cmd() -> None:
     with db.reader() as conn:
         s = status(conn)
     click.echo(
-        f"arrivals_raw={s.raw_arrivals_count}  runs_observed={s.runs_observed_count}  "
-        f"forecasts pending/resolved/unresolvable={s.forecasts_pending}/{s.forecasts_resolved}/{s.forecasts_unresolvable}"
+        f"L      arrivals={s.raw_arrivals_count}  positions={s.positions_count}  "
+        f"runs_observed={s.runs_observed_count}"
+    )
+    click.echo(f"bus    predictions={s.bus_predictions_count}")
+    click.echo(f"metra  predictions={s.metra_arrivals_count}")
+    click.echo(f"ic     predictions={s.intercampus_arrivals_count}")
+    click.echo(
+        f"forecasts pending/resolved/unresolvable="
+        f"{s.forecasts_pending}/{s.forecasts_resolved}/{s.forecasts_unresolvable}"
     )
     if s.latest_poll:
-        click.echo(f"latest poll: {s.latest_poll.isoformat()}")
+        click.echo(f"latest L poll: {s.latest_poll.isoformat()}")
     if s.overall_p80_coverage is not None:
         click.echo(f"overall p80 coverage: {s.overall_p80_coverage:.1%}")
 

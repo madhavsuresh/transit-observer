@@ -12,6 +12,7 @@ dependencies = [
     "structlog>=24.0",
     "click>=8.1",
     "pytz>=2024.1",
+    "gtfs-realtime-bindings>=1.0",
 ]
 
 [project.scripts]

@@ -21,9 +21,12 @@ import duckdb
 import structlog
 
 from . import db, trajectory
+from .bus_client import CTABusClient
 from .catalog import LStation, load_catalog
 from .config import CHICAGO, Settings, settings
 from .cta_train_client import ArrivalRaw, CTATrainClient
+from .intercampus_client import IntercampusClient
+from .metra_client import MetraClient
 from .resolver import resolve_due_forecasts
 from .trip_generator import enqueue_forecast, predict_trip, sample_trip
 
@@ -43,13 +46,20 @@ async def run(stngs: Settings = settings) -> None:
     log.info("collector.startup", stations=len(catalog), poll_interval=stngs.poll_interval_seconds)
 
     client = CTATrainClient(stngs.cta_train_api_key)
+    bus_client = CTABusClient(stngs.cta_bus_api_key) if stngs.cta_bus_api_key else None
+    metra_client = MetraClient(stngs.metra_api_key) if stngs.metra_api_key else None
+    intercampus_client = IntercampusClient()  # no auth
     rotation = itertools.cycle(catalog)
+    bus_rotation = itertools.cycle(stngs.monitored_bus_stops) if stngs.monitored_bus_stops else None
 
     last_replica_refresh = datetime.now(CHICAGO)
     last_trip_gen = datetime.now(CHICAGO)
     last_resolver = datetime.now(CHICAGO)
     last_trajectory = datetime.now(CHICAGO)
     last_positions_poll = datetime.now(CHICAGO)
+    last_bus_poll = datetime.now(CHICAGO)
+    last_metra_poll = datetime.now(CHICAGO)
+    last_intercampus_poll = datetime.now(CHICAGO)
     rng = random.Random()
 
     stop_event = asyncio.Event()
@@ -69,6 +79,25 @@ async def run(stngs: Settings = settings) -> None:
                     if n_positions:
                         log.info("positions.polled", n=n_positions)
                     last_positions_poll = tick_started
+
+                if bus_client and bus_rotation and (tick_started - last_bus_poll).total_seconds() >= stngs.poll_interval_seconds:
+                    bus_batch = _take(bus_rotation, stngs.bus_round_robin_batch)
+                    n_bus = await _poll_bus(conn, bus_client, batch=bus_batch)
+                    if n_bus:
+                        log.info("bus.polled", n=n_bus)
+                    last_bus_poll = tick_started
+
+                if metra_client and (tick_started - last_metra_poll).total_seconds() >= stngs.metra_poll_interval_seconds:
+                    n_metra = await _poll_metra(conn, metra_client)
+                    if n_metra:
+                        log.info("metra.polled", n=n_metra)
+                    last_metra_poll = tick_started
+
+                if (tick_started - last_intercampus_poll).total_seconds() >= stngs.intercampus_poll_interval_seconds:
+                    n_ic = await _poll_intercampus(conn, intercampus_client)
+                    if n_ic:
+                        log.info("intercampus.polled", n=n_ic)
+                    last_intercampus_poll = tick_started
 
                 if (tick_started - last_trajectory).total_seconds() >= stngs.poll_interval_seconds * 4:
                     written = trajectory.build_observed_runs(conn, now=tick_started)
@@ -101,6 +130,11 @@ async def run(stngs: Settings = settings) -> None:
                     pass
         finally:
             await client.aclose()
+            if bus_client:
+                await bus_client.aclose()
+            if metra_client:
+                await metra_client.aclose()
+            await intercampus_client.aclose()
             log.info("collector.shutdown")
 
 
@@ -178,6 +212,109 @@ async def _poll_positions(
             next_station_map_id, next_station_name,
             predicted_at, next_arrival_at, is_approaching, is_delayed
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+async def _poll_bus(
+    conn: duckdb.DuckDBPyConnection,
+    client: CTABusClient,
+    *,
+    batch: list[tuple[str, int]],
+) -> int:
+    """Poll CTA Bus predictions for a small rotating set of monitored
+    (route, stop_id) pairs. CTA Bus has ~14k stops and a 10k/day budget;
+    cover a curated subset rather than the whole catalog."""
+    tasks = [client.fetch_predictions(route=route, stop_id=stop_id) for route, stop_id in batch]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    polled_at = datetime.now(CHICAGO)
+    rows: list[tuple] = []
+    for (route, stop_id), preds in zip(batch, results, strict=True):
+        if isinstance(preds, Exception):
+            log.warning("bus.error", route=route, stop_id=stop_id, err=str(preds))
+            continue
+        for p in preds:
+            rows.append((
+                polled_at, p.route, p.route_name, p.vehicle_id, p.stop_id, p.stop_name,
+                p.destination_name, p.direction_name, p.generated_at, p.arrival_at,
+                p.is_delayed, p.is_approaching,
+            ))
+    if not rows:
+        return 0
+    conn.executemany(
+        """
+        INSERT INTO bus_predictions_raw (
+            polled_at, route, route_name, vehicle_id, stop_id, stop_name,
+            destination_name, direction_name, generated_at, arrival_at,
+            is_delayed, is_approaching
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+async def _poll_metra(
+    conn: duckdb.DuckDBPyConnection,
+    client: MetraClient,
+) -> int:
+    try:
+        updates = await client.fetch_trip_updates()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("metra.error", err=str(exc))
+        return 0
+    polled_at = datetime.now(CHICAGO)
+    if not updates:
+        return 0
+    rows = [
+        (
+            polled_at, u.route_id, u.trip_id, u.station_id, u.direction_id,
+            u.schedule_relationship, u.scheduled_at, u.predicted_at, u.delay_seconds,
+        )
+        for u in updates
+    ]
+    conn.executemany(
+        """
+        INSERT INTO metra_arrivals_raw (
+            polled_at, route_id, trip_id, station_id, direction_id,
+            schedule_relationship, scheduled_at, predicted_at, delay_seconds
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+async def _poll_intercampus(
+    conn: duckdb.DuckDBPyConnection,
+    client: IntercampusClient,
+) -> int:
+    try:
+        updates = await client.fetch_trip_updates()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("intercampus.error", err=str(exc))
+        return 0
+    polled_at = datetime.now(CHICAGO)
+    if not updates:
+        return 0
+    rows = [
+        (
+            polled_at, u.route_id, u.trip_id, str(u.direction_id) if u.direction_id is not None else None,
+            u.stop_id, None, None,
+            u.predicted_at, u.predicted_at, u.delay_seconds,
+            (u.delay_seconds or 0) > 60, "gtfs-rt",
+        )
+        for u in updates
+    ]
+    conn.executemany(
+        """
+        INSERT INTO intercampus_arrivals_raw (
+            polled_at, route_id, trip_id, direction,
+            stop_id, stop_name, destination_name,
+            predicted_at, arrival_at, delay_seconds, is_delayed, time_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )

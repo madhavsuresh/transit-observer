@@ -12,7 +12,13 @@ For each random sampled trip on a CTA L line:
 - **In-vehicle kernel** — once boarded, how long does the train take to reach the alighting station?
 - **Composed total** — wait + in-vehicle as a single distribution. Coverage = P(actual ≤ predicted p80).
 
-v1 is **CTA L only, single-leg trips, no walking, no transfers**. Bus, Metra, Intercampus, transfers, and Divvy come later.
+v1 scope:
+- **CTA L** — prediction + resolution + direction-label audit (the full loop)
+- **CTA Bus** — raw collection only (monitored-stop set; prediction/resolution to come)
+- **Metra** — raw GTFS-RT collection only
+- **Intercampus** (Northwestern shuttle) — raw GTFS-RT collection only
+
+No walking, no transfers, no Divvy yet. Multi-mode prediction + resolution come in v2.
 
 ## What "good coverage" means
 
@@ -23,16 +29,21 @@ For each (line, direction, hour-of-day) bucket we want **at least 5 realized sam
 ```bash
 brew install uv
 uv sync
-export CTA_TRAIN_API_KEY=<your-cta-key>
-./run.sh                      # collector + resolver in this terminal
+export CTA_TRAIN_API_KEY=<your-cta-key>          # required
+export CTA_BUS_API_KEY=<your-bus-key>            # optional (skips bus poller if absent)
+export METRA_API_KEY=<your-metra-key>            # optional (skips Metra poller if absent)
+./run.sh                                         # collector + resolver in this terminal
 ```
 
 The single command starts:
 
-- the **collector** — round-robin polls `ttarrivals.aspx` across the L catalog (under CTA's 100-req-per-5-min limit) and writes raw arrivals to DuckDB.
-- the **trajectory builder** — runs on each tick, derives observed run-by-station times from arrivals_raw.
-- the **trip generator** — periodically picks a random (line, boarding, alighting) and enqueues a forecast.
-- the **resolver** — finds the realized train for each due forecast and writes the outcome.
+- the **L collector** — round-robin polls `ttarrivals.aspx` across the L catalog (under CTA's 100-req-per-5-min limit) and writes raw arrivals to `train_arrivals_raw`. Also pulls `ttpositions.aspx` once per tick (1 req per line, 8 reqs/30s) into `train_positions_raw` as a stronger trajectory signal.
+- the **trajectory builder** — derives observed run-by-station arrivals from positions (preferred) and arrivals.
+- the **bus collector** — round-robin polls `getpredictions` for a configurable monitored-stop set (see `config.py`).
+- the **Metra collector** — pulls Metra GTFS-RT tripUpdates every 60s into `metra_arrivals_raw`.
+- the **Intercampus collector** — pulls Northwestern TripShot GTFS-RT every 60s into `intercampus_arrivals_raw` (no auth).
+- the **trip generator** (L only for now) — picks random (line, boarding, alighting) and enqueues a forecast.
+- the **resolver** — finds the realized run for each due forecast, writes the outcome, and runs the direction-filter audit on each resolved forecast.
 
 DB lives at `data/transit_observer.duckdb` (writer) with `data/transit_observer_readonly.duckdb` as the 60s-refreshed read replica.
 

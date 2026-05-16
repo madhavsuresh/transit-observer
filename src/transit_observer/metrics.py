@@ -143,6 +143,10 @@ def calibration_bins(
 class Status:
     raw_arrivals_count: int
     runs_observed_count: int
+    positions_count: int
+    bus_predictions_count: int
+    metra_arrivals_count: int
+    intercampus_arrivals_count: int
     forecasts_pending: int
     forecasts_resolved: int
     forecasts_unresolvable: int
@@ -154,6 +158,10 @@ class Status:
 def status(conn: duckdb.DuckDBPyConnection) -> Status:
     raw = conn.execute("SELECT COUNT(*), MAX(polled_at) FROM train_arrivals_raw").fetchone() or (0, None)
     runs = conn.execute("SELECT COUNT(*) FROM train_runs_observed").fetchone() or (0,)
+    positions = conn.execute("SELECT COUNT(*) FROM train_positions_raw").fetchone() or (0,)
+    bus = conn.execute("SELECT COUNT(*) FROM bus_predictions_raw").fetchone() or (0,)
+    metra = conn.execute("SELECT COUNT(*) FROM metra_arrivals_raw").fetchone() or (0,)
+    intercampus = conn.execute("SELECT COUNT(*) FROM intercampus_arrivals_raw").fetchone() or (0,)
     queue = conn.execute(
         """
         SELECT
@@ -170,6 +178,10 @@ def status(conn: duckdb.DuckDBPyConnection) -> Status:
     return Status(
         raw_arrivals_count=raw[0] or 0,
         runs_observed_count=runs[0] or 0,
+        positions_count=positions[0] or 0,
+        bus_predictions_count=bus[0] or 0,
+        metra_arrivals_count=metra[0] or 0,
+        intercampus_arrivals_count=intercampus[0] or 0,
         forecasts_pending=queue[0] or 0,
         forecasts_resolved=queue[1] or 0,
         forecasts_unresolvable=queue[2] or 0,
