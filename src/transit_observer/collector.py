@@ -102,7 +102,10 @@ async def run(stngs: Settings = settings) -> None:
                         log.info("metra.polled", n=n_metra)
                     last_metra_poll = tick_started
 
-                if (tick_started - last_intercampus_poll).total_seconds() >= stngs.intercampus_poll_interval_seconds:
+                if (
+                    _intercampus_service_active(tick_started)
+                    and (tick_started - last_intercampus_poll).total_seconds() >= stngs.intercampus_poll_interval_seconds
+                ):
                     n_ic = await _poll_intercampus(conn, intercampus_client)
                     if n_ic:
                         log.info("intercampus.polled", n=n_ic)
@@ -122,7 +125,8 @@ async def run(stngs: Settings = settings) -> None:
                         enabled_modes.append("bus")
                     if metra_client:
                         enabled_modes.append("metra")
-                    enabled_modes.append("intercampus")  # no key needed
+                    if _intercampus_service_active(tick_started):
+                        enabled_modes.append("intercampus")  # no key needed; M-F only
                     n_enqueued = _generate_corridor_predictions(
                         conn,
                         now=tick_started,
@@ -159,6 +163,16 @@ async def run(stngs: Settings = settings) -> None:
                 await metra_client.aclose()
             await intercampus_client.aclose()
             log.info("collector.shutdown")
+
+
+def _intercampus_service_active(now: datetime) -> bool:
+    """Northwestern Intercampus shuttle runs Monday-Friday only.
+
+    Skipping weekend polls saves ~2,880 round-trips per weekend. We still
+    poll on holidays -- the feed is usually just empty then, and a
+    full Chicago academic calendar isn't worth wiring in.
+    """
+    return now.weekday() < 5  # Mon=0 .. Fri=4
 
 
 def _take(it: Iterable, n: int) -> list:
