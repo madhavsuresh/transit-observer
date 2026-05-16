@@ -29,10 +29,21 @@ For each (line, direction, hour-of-day) bucket we want **at least 5 realized sam
 ```bash
 brew install uv
 uv sync
-export CTA_TRAIN_API_KEY=<your-cta-key>          # required
-export CTA_BUS_API_KEY=<your-bus-key>            # optional (skips bus poller if absent)
-export METRA_API_KEY=<your-metra-key>            # optional (skips Metra poller if absent)
-./run.sh                                         # collector + dashboard, foreground
+./run.sh                       # collector + dashboard, foreground
+```
+
+On first run, `./run.sh` notices there's no `config.toml` and walks you through an
+interactive prompt for the CTA Train (required), CTA Bus, and Metra API keys.
+The file ends up gitignored at `config.toml`. To re-run the prompt later:
+`./run.sh setup` or `uv run transit setup`.
+
+If you'd rather skip the file entirely, set the env vars instead — they win over
+`config.toml` whenever both are present:
+
+```bash
+export CTA_TRAIN_API_KEY=<your-cta-key>
+export CTA_BUS_API_KEY=<your-bus-key>    # optional
+export METRA_API_KEY=<your-metra-key>    # optional
 ```
 
 Dashboard at http://127.0.0.1:8501. The single command starts:

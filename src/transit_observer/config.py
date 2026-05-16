@@ -1,12 +1,16 @@
-"""Configuration loaded from environment variables.
+"""Configuration loaded from ``config.toml`` with environment-variable override.
 
-Single source of truth for paths, intervals, rate limits, and tunables.
-Modules import `settings` rather than reading env vars directly.
+Resolution order (highest precedence first):
+1. ``CTA_TRAIN_API_KEY`` / ``CTA_BUS_API_KEY`` / ``METRA_API_KEY`` env vars.
+2. ``[api_keys]`` section in ``config.toml`` at the project root.
+
+Use ``transit setup`` to create or refresh ``config.toml`` interactively.
 """
 
 from __future__ import annotations
 
 import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -55,17 +59,45 @@ class Settings:
     )
 
 
+ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATH = ROOT / "config.toml"
+
+
+def _read_config_file(path: Path | None = None) -> dict:
+    target = path if path is not None else CONFIG_PATH
+    if not target.exists():
+        return {}
+    try:
+        with target.open("rb") as f:
+            return tomllib.load(f) or {}
+    except (tomllib.TOMLDecodeError, OSError):
+        return {}
+
+
+def _resolve(env_key: str, file_dict: dict, file_key: str) -> str | None:
+    env_value = os.environ.get(env_key)
+    if env_value:
+        return env_value
+    file_value = file_dict.get(file_key)
+    if isinstance(file_value, str) and file_value:
+        return file_value
+    return None
+
+
 def load() -> Settings:
-    """Read env + filesystem defaults."""
-    root = Path(__file__).resolve().parents[2]
-    data = root / "data"
-    logs = root / "logs"
+    """Read config + env defaults. Env vars override the TOML file."""
+    data = ROOT / "data"
+    logs = ROOT / "logs"
     data.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
+
+    file_config = _read_config_file()
+    api_keys = file_config.get("api_keys", {}) if isinstance(file_config, dict) else {}
+
     return Settings(
-        cta_train_api_key=os.environ.get("CTA_TRAIN_API_KEY"),
-        cta_bus_api_key=os.environ.get("CTA_BUS_API_KEY"),
-        metra_api_key=os.environ.get("METRA_API_KEY"),
+        cta_train_api_key=_resolve("CTA_TRAIN_API_KEY", api_keys, "cta_train"),
+        cta_bus_api_key=_resolve("CTA_BUS_API_KEY", api_keys, "cta_bus"),
+        metra_api_key=_resolve("METRA_API_KEY", api_keys, "metra"),
         data_dir=data,
         logs_dir=logs,
         db_path=data / "transit_observer.duckdb",

@@ -5,8 +5,10 @@ from __future__ import annotations
 import click
 
 from . import db
+from .config import CONFIG_PATH
 from .direction_audit import audit_summary
 from .metrics import calibration_bins, corridor_coverage, status, uncovered_buckets
+from .setup import write_config
 
 
 @click.group()
@@ -84,6 +86,32 @@ def audit(min_samples: int) -> None:
     click.echo(f"{'line':<8}{'n':>5}  {'recall':>8}  {'precision':>10}")
     for r in rows:
         click.echo(f"{r.line:<8}{r.n_audited:>5}  {r.recall_rate:>7.1%}  {r.avg_direction_precision:>9.1%}")
+
+
+@cli.command()
+@click.option("--force", is_flag=True, help="Overwrite an existing config.toml without prompting.")
+def setup(force: bool) -> None:
+    """Create config.toml interactively (API keys)."""
+    if CONFIG_PATH.exists() and not force:
+        if not click.confirm(f"{CONFIG_PATH} already exists. Overwrite?", default=False):
+            click.echo("Aborted.")
+            return
+    click.echo()
+    click.echo("Set up transit-observer API keys.")
+    click.echo("CTA Train Tracker key is required; others are optional (press Enter to skip).")
+    click.echo()
+    cta_train = click.prompt("CTA Train Tracker API key", type=str).strip()
+    cta_bus = click.prompt(
+        "CTA Bus Tracker API key (optional)", default="", show_default=False, type=str
+    ).strip()
+    metra = click.prompt(
+        "Metra GTFS-RT API key (optional)", default="", show_default=False, type=str
+    ).strip()
+    if not cta_train:
+        click.echo("error: CTA Train Tracker API key is required.", err=True)
+        raise click.Abort()
+    write_config(cta_train=cta_train, cta_bus=cta_bus, metra=metra)
+    click.echo(f"wrote {CONFIG_PATH}")
 
 
 @cli.command()

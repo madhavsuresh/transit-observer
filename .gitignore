@@ -8,3 +8,4 @@ data/*.duckdb.wal
 data/*.tmp
 logs/
 .DS_Store
+config.toml
