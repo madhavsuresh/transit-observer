@@ -25,7 +25,8 @@ Environment overrides (highest precedence):
   CTA_TRAIN_API_KEY, CTA_BUS_API_KEY, METRA_API_KEY
 
 URLs:
-  Dashboard:  http://127.0.0.1:8501
+  Dashboard:  http://127.0.0.1:8502
+  API:        http://127.0.0.1:8000      (swagger at /docs)
 EOF
   exit 0
 fi
@@ -46,10 +47,14 @@ echo "==> starting collector"
 uv run python -m transit_observer.collector &
 COLLECTOR_PID=$!
 
-echo "==> starting dashboard on http://127.0.0.1:8501"
+echo "==> starting API on http://127.0.0.1:8000 (docs at /docs)"
+uv run transit api --host 127.0.0.1 --port 8000 &
+API_PID=$!
+
+echo "==> starting dashboard on http://127.0.0.1:8502"
 uv run streamlit run src/transit_observer/dashboard.py \
   --server.address=127.0.0.1 \
-  --server.port=8501 \
+  --server.port=8502 \
   --server.headless=true \
   --browser.gatherUsageStats=false &
 DASHBOARD_PID=$!
@@ -57,15 +62,17 @@ DASHBOARD_PID=$!
 cleanup() {
   echo
   echo "==> stopping transit-observer"
-  kill -TERM "$COLLECTOR_PID" "$DASHBOARD_PID" 2>/dev/null || true
+  kill -TERM "$COLLECTOR_PID" "$API_PID" "$DASHBOARD_PID" 2>/dev/null || true
   for _ in 1 2 3 4 5; do
-    if ! kill -0 "$COLLECTOR_PID" 2>/dev/null && ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+    if ! kill -0 "$COLLECTOR_PID" 2>/dev/null \
+       && ! kill -0 "$API_PID" 2>/dev/null \
+       && ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
       break
     fi
     sleep 1
   done
-  kill -KILL "$COLLECTOR_PID" "$DASHBOARD_PID" 2>/dev/null || true
+  kill -KILL "$COLLECTOR_PID" "$API_PID" "$DASHBOARD_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-wait "$COLLECTOR_PID" "$DASHBOARD_PID"
+wait "$COLLECTOR_PID" "$API_PID" "$DASHBOARD_PID"

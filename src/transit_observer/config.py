@@ -40,6 +40,10 @@ class Settings:
     forecast_resolution_buffer_seconds: float = 300.0  # wait this long after p90 before declaring unresolvable
     read_replica_refresh_seconds: float = 60.0
 
+    query_import_interval_seconds: float = 60.0   # how often to import API queries.ndjson into query_log
+    promotion_interval_seconds: float = 600.0     # how often to scan for popular ODs to auto-upgrade
+    promotion_min_count: int = 50                 # queries-in-7-days threshold for auto-upgrade
+
     line_codes: tuple[str, ...] = field(
         default_factory=lambda: ("red", "blue", "brn", "g", "org", "p", "pink", "y")
     )

@@ -125,10 +125,41 @@ CREATE TABLE IF NOT EXISTS corridors (
     priority                 INTEGER NOT NULL DEFAULT 5,
     is_active                BOOLEAN NOT NULL DEFAULT TRUE,
     seeded_at                TIMESTAMPTZ NOT NULL,
-    last_predicted_at        TIMESTAMPTZ
+    last_predicted_at        TIMESTAMPTZ,
+    source                   TEXT NOT NULL DEFAULT 'seed',  -- 'seed' | 'auto_upgraded'
+    promoted_from_query_count INTEGER                       -- only set when source='auto_upgraded'
 );
 
 CREATE INDEX IF NOT EXISTS idx_corridors_mode ON corridors(mode, is_active);
+
+CREATE TABLE IF NOT EXISTS query_log (
+    query_id                 TEXT PRIMARY KEY,
+    queried_at               TIMESTAMPTZ NOT NULL,
+    client_id                TEXT,
+    mode                     TEXT NOT NULL,
+    line                     TEXT NOT NULL,
+    direction_code           TEXT,
+    boarding_int_id          INTEGER NOT NULL DEFAULT 0,
+    boarding_text_id         TEXT,
+    boarding_station_name    TEXT,
+    alighting_int_id         INTEGER NOT NULL DEFAULT 0,
+    alighting_text_id        TEXT,
+    alighting_station_name   TEXT,
+    predicted_wait_mean      DOUBLE,
+    predicted_wait_p50       DOUBLE,
+    predicted_wait_p80       DOUBLE,
+    predicted_wait_p90       DOUBLE,
+    predicted_in_vehicle_mean DOUBLE,
+    predicted_total_p50      DOUBLE,
+    predicted_total_p80      DOUBLE,
+    predicted_total_p90      DOUBLE,
+    predictor_version        TEXT,
+    success                  BOOLEAN NOT NULL,
+    error_reason             TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_query_log_at ON query_log(queried_at);
+CREATE INDEX IF NOT EXISTS idx_query_log_od ON query_log(mode, line, boarding_int_id, boarding_text_id, alighting_int_id, alighting_text_id);
 
 CREATE TABLE IF NOT EXISTS metra_arrivals_raw (
     polled_at              TIMESTAMPTZ NOT NULL,
@@ -298,10 +329,12 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 # DuckDB doesn't have CREATE COLUMN IF NOT EXISTS, so we probe pragma_table_info
 # and skip when the column already exists. Cheap to run on every startup.
 _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
-    ("forecast_queue", "corridor_id",       "TEXT"),
-    ("forecast_queue", "predictor_version", "TEXT"),
-    ("forecast_queue", "feature_json",      "TEXT"),
+    ("forecast_queue", "corridor_id",        "TEXT"),
+    ("forecast_queue", "predictor_version",  "TEXT"),
+    ("forecast_queue", "feature_json",       "TEXT"),
     ("forecast_outcomes", "truth_confidence", "DOUBLE"),
+    ("corridors", "source",                  "TEXT NOT NULL DEFAULT 'seed'"),
+    ("corridors", "promoted_from_query_count", "INTEGER"),
 )
 
 

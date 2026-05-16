@@ -195,6 +195,15 @@ def calibration(bins: int) -> None:
         click.echo(f"{b.predicted_lower:>6.2f}{b.predicted_upper:>7.2f}  {b.n:>5}  {b.actual_failure_rate:>6.1%}")
 
 
+@cli.command()
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", default=8000, show_default=True, type=int)
+def api(host: str, port: int) -> None:
+    """Run the HTTP prediction API. POST queries get logged for auto-promote."""
+    import uvicorn
+    uvicorn.run("transit_observer.api:app", host=host, port=port, reload=False)
+
+
 def main() -> None:
     cli.add_command(status_cmd, name="status")
     cli(standalone_mode=True)
