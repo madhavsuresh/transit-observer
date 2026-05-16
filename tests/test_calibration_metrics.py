@@ -11,6 +11,9 @@ import pytest
 
 from transit_observer import db
 from transit_observer.metrics import (
+    active_predictor_rows,
+    available_predictors,
+    corridor_coverage,
     diagnose_pit_shape,
     historical_prediction,
     live_data_diagnostic,
@@ -46,6 +49,8 @@ def _insert_calibrated_lognormal(
     n: int,
     seed: int = 0,
     truth_conf: float = 1.0,
+    predictor_version: str | None = None,
+    fid_prefix: str | None = None,
 ) -> None:
     """Insert n resolved forecasts drawn from a log-normal that matches
     the stored (p50, p80) — i.e. a perfectly-calibrated kernel."""
@@ -55,8 +60,9 @@ def _insert_calibrated_lognormal(
     p50 = math.exp(mu)
     p80 = math.exp(mu + sigma * _Z80)
     p90 = math.exp(mu + sigma * z_norm.inv_cdf(0.9))
+    prefix = fid_prefix or line
     for i in range(n):
-        forecast_id = f"{line}-{i}"
+        forecast_id = f"{prefix}-{i}"
         actual = math.exp(mu + sigma * z_norm.inv_cdf(rng.random()))
         leave_at = T0 + timedelta(minutes=i)
         conn.execute(
@@ -66,11 +72,13 @@ def _insert_calibrated_lognormal(
                 mode, line, direction_code,
                 boarding_map_id, alighting_map_id,
                 predicted_total_p50, predicted_total_p80, predicted_total_p90,
+                predictor_version,
                 resolve_after, status
-            ) VALUES (?, ?, ?, ?, 'L', ?, '1', 0, 0, ?, ?, ?, ?, 'resolved')
+            ) VALUES (?, ?, ?, ?, 'L', ?, '1', 0, 0, ?, ?, ?, ?, ?, 'resolved')
             """,
             [forecast_id, leave_at, leave_at, leave_at, line,
-             p50, p80, p90, leave_at + timedelta(minutes=60)],
+             p50, p80, p90, predictor_version,
+             leave_at + timedelta(minutes=60)],
         )
         conn.execute(
             """
@@ -324,3 +332,78 @@ def test_diagnose_pit_shape_right_skew_actuals_slower():
     ]
     diagnosis = diagnose_pit_shape(bins)
     assert "slower" in diagnosis or "right" in diagnosis
+
+
+# ----- predictor_version filter pass-through --------------------------------
+
+
+def test_predictor_version_filter_isolates_one_predictor(conn):
+    """When two predictors write rows for the same line, the filter must
+    return only the requested predictor's outcomes."""
+    _insert_calibrated_lognormal(
+        conn, line="Red", mu=6.2, sigma=0.4, n=200,
+        predictor_version="kernel-v1", fid_prefix="k",
+    )
+    _insert_calibrated_lognormal(
+        conn, line="Red", mu=6.2, sigma=0.4, n=200,
+        predictor_version="gbm-v1", fid_prefix="g",
+    )
+
+    # Unfiltered: sees both
+    all_counts = per_line_resolved_counts(conn)
+    assert sum(r.n_resolved for r in all_counts if r.line == "Red") == 400
+
+    # Filtered to kernel-v1: only sees its 200
+    k_counts = per_line_resolved_counts(conn, predictor_version="kernel-v1")
+    assert sum(r.n_resolved for r in k_counts if r.line == "Red") == 200
+
+    # Filtered to gbm-v1: only sees its 200
+    g_counts = per_line_resolved_counts(conn, predictor_version="gbm-v1")
+    assert sum(r.n_resolved for r in g_counts if r.line == "Red") == 200
+
+    # reliability_curve isolates per predictor too
+    k_rel = reliability_curve(conn, predictor_version="kernel-v1", min_samples=30)
+    g_rel = reliability_curve(conn, predictor_version="gbm-v1", min_samples=30)
+    assert k_rel and g_rel
+    # Each predictor sees exactly its share
+    assert k_rel[0].n == 200
+    assert g_rel[0].n == 200
+
+
+def test_available_predictors_lists_distinct_versions(conn):
+    _insert_calibrated_lognormal(
+        conn, line="Red", mu=6.2, sigma=0.4, n=200,
+        predictor_version="kernel-v1", fid_prefix="k",
+    )
+    _insert_calibrated_lognormal(
+        conn, line="Blue", mu=6.0, sigma=0.4, n=120,
+        predictor_version="gbm-v1", fid_prefix="g",
+    )
+    out = available_predictors(conn)
+    assert {v for v, _n in out} == {"kernel-v1", "gbm-v1"}
+    # kernel-v1 has more rows -> ranks first
+    assert out[0][0] == "kernel-v1"
+    assert out[0][1] == 200
+
+
+def test_active_predictor_rows_reads_registry_table(conn):
+    from datetime import datetime, timezone
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    conn.execute(
+        """
+        INSERT INTO predictor_active
+            (corridor_id, predictor_version, decided_at, decided_score,
+             incumbent_score, margin, n_consecutive_wins,
+             pending_candidate, pending_wins, pending_score)
+        VALUES ('cta-red-belmont-lake-sb', 'gbm-v1', ?, 0.12, 0.15, 0.03, 1,
+                'kernel-v1+eb', 1, 0.14)
+        """,
+        [now],
+    )
+    rows = active_predictor_rows(conn)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.corridor_id == "cta-red-belmont-lake-sb"
+    assert r.predictor_version == "gbm-v1"
+    assert r.pending_candidate == "kernel-v1+eb"
+    assert r.pending_wins == 1

@@ -93,9 +93,16 @@ def corridor_coverage(
     conn: duckdb.DuckDBPyConnection,
     *,
     min_samples: int = 5,
+    predictor_version: str | None = None,
 ) -> list[CorridorCoverage]:
-    rows = conn.execute(
-        """
+    """Per-(line, direction, hour, weekday) coverage rollup.
+
+    With ``predictor_version=None`` the rollup aggregates across every
+    predictor that wrote a row — useful for an overall health check.
+    Pass a specific version (e.g. ``"kernel-v1"``) to isolate one
+    predictor for comparison.
+    """
+    sql = """
         SELECT q.line, q.direction_code,
                EXTRACT(hour FROM q.leave_at)::INTEGER AS hod,
                (EXTRACT(dow FROM q.leave_at) BETWEEN 1 AND 5) AS weekday,
@@ -106,12 +113,18 @@ def corridor_coverage(
                MEDIAN(o.p50_residual_seconds) AS median_residual
           FROM forecast_outcomes o
           JOIN forecast_queue q USING (forecast_id)
+    """
+    params: list = []
+    if predictor_version is not None:
+        sql += " WHERE q.predictor_version = ?\n"
+        params.append(predictor_version)
+    sql += """
          GROUP BY q.line, q.direction_code, hod, weekday
         HAVING COUNT(*) >= ?
          ORDER BY q.line, q.direction_code, hod, weekday
-        """,
-        [min_samples],
-    ).fetchall()
+    """
+    params.append(min_samples)
+    rows = conn.execute(sql, params).fetchall()
     return [
         CorridorCoverage(
             line=line,
@@ -164,12 +177,14 @@ def _resolved_forecasts_for_calibration(
     *,
     line: str | None,
     min_truth_confidence: float,
+    predictor_version: str | None = None,
 ) -> list[tuple[str, float, float, float, float]]:
     """Pull (line, p50, p80, p90, actual_total_seconds) for resolved rows.
 
     Filters to ``status='resolved'`` and ``truth_confidence >= threshold``
     so that headline calibration metrics only count cleanly-bracketed
-    outcomes (matches the corpus_summary policy).
+    outcomes (matches the corpus_summary policy). Optional
+    ``predictor_version`` filter isolates one predictor.
     """
     sql = """
         SELECT q.line,
@@ -189,6 +204,9 @@ def _resolved_forecasts_for_calibration(
     if line is not None:
         sql += " AND q.line = ?"
         params.append(line)
+    if predictor_version is not None:
+        sql += " AND q.predictor_version = ?"
+        params.append(predictor_version)
     return conn.execute(sql, params).fetchall()
 
 
@@ -199,6 +217,7 @@ def reliability_curve(
     quantile_grid: tuple[float, ...] = _DEFAULT_RELIABILITY_GRID,
     min_truth_confidence: float = 0.5,
     min_samples: int = 30,
+    predictor_version: str | None = None,
 ) -> list[ReliabilityPoint]:
     """For each (line, q), empirical fraction with actual ≤ fitted q-quantile.
 
@@ -212,6 +231,7 @@ def reliability_curve(
     """
     rows = _resolved_forecasts_for_calibration(
         conn, line=line, min_truth_confidence=min_truth_confidence,
+        predictor_version=predictor_version,
     )
     by_line: dict[str, list[tuple[float, float, float, float]]] = {}
     for ln, p50, p80, p90, actual in rows:
@@ -252,6 +272,7 @@ def pit_histogram(
     n_bins: int = 20,
     min_truth_confidence: float = 0.5,
     min_samples: int = 30,
+    predictor_version: str | None = None,
 ) -> list[PitBin]:
     """Binned PIT values per line.
 
@@ -262,6 +283,7 @@ def pit_histogram(
     """
     rows = _resolved_forecasts_for_calibration(
         conn, line=line, min_truth_confidence=min_truth_confidence,
+        predictor_version=predictor_version,
     )
     by_line: dict[str, list[float]] = {}
     for ln, p50, p80, _p90, actual in rows:
@@ -476,11 +498,11 @@ def per_line_resolved_counts(
     conn: duckdb.DuckDBPyConnection,
     *,
     min_truth_confidence: float = 0.5,
+    predictor_version: str | None = None,
 ) -> list[LineSampleCount]:
     """How many resolved outcomes exist per (mode, line). Lets the dashboard
     explain which lines are present in the PIT / reliability charts."""
-    rows = conn.execute(
-        """
+    sql = """
         SELECT q.mode, q.line,
                COUNT(*) AS n_resolved,
                COUNT(*) FILTER (WHERE COALESCE(o.truth_confidence, 0) >= ?) AS n_hi
@@ -490,11 +512,16 @@ def per_line_resolved_counts(
            AND q.predicted_total_p50 > 0
            AND q.predicted_total_p80 > q.predicted_total_p50
            AND o.actual_total_seconds IS NOT NULL
+    """
+    params: list = [min_truth_confidence]
+    if predictor_version is not None:
+        sql += " AND q.predictor_version = ?\n"
+        params.append(predictor_version)
+    sql += """
          GROUP BY q.mode, q.line
          ORDER BY n_resolved DESC
-        """,
-        [min_truth_confidence],
-    ).fetchall()
+    """
+    rows = conn.execute(sql, params).fetchall()
     return [
         LineSampleCount(line=ln, mode=mode, n_resolved=int(nr), n_resolved_high_conf=int(nhi))
         for mode, ln, nr, nhi in rows
@@ -506,6 +533,7 @@ def reliability_curve_aggregated(
     *,
     quantile_grid: tuple[float, ...] = _DEFAULT_RELIABILITY_GRID,
     min_truth_confidence: float = 0.5,
+    predictor_version: str | None = None,
 ) -> list[ReliabilityPoint]:
     """Reliability curve across all lines combined (line='ALL').
 
@@ -514,6 +542,7 @@ def reliability_curve_aggregated(
     """
     rows = _resolved_forecasts_for_calibration(
         conn, line=None, min_truth_confidence=min_truth_confidence,
+        predictor_version=predictor_version,
     )
     if not rows:
         return []
@@ -540,10 +569,12 @@ def pit_histogram_aggregated(
     *,
     n_bins: int = 20,
     min_truth_confidence: float = 0.5,
+    predictor_version: str | None = None,
 ) -> list[PitBin]:
     """PIT histogram across all lines combined (line='ALL')."""
     rows = _resolved_forecasts_for_calibration(
         conn, line=None, min_truth_confidence=min_truth_confidence,
+        predictor_version=predictor_version,
     )
     pits: list[float] = []
     for _ln, p50, p80, _p90, actual in rows:
@@ -805,6 +836,81 @@ def corpus_summary(
             n_pred, n_resolved, n_unresolvable,
             cov80, median_resid, median_tc, last_at,
         ) in rows
+    ]
+
+
+@dataclass(frozen=True)
+class ActivePredictorRow:
+    """One row of the active-predictor dashboard table."""
+    corridor_id: str
+    predictor_version: str
+    decided_at: datetime | None
+    decided_score: float | None
+    pending_candidate: str | None
+    pending_wins: int
+    pending_score: float | None
+
+
+def available_predictors(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    min_resolved: int = 1,
+) -> list[tuple[str, int]]:
+    """Distinct predictor_versions in forecast_queue with ≥ ``min_resolved``
+    rows. Returns ``[(predictor_version, n_resolved), ...]`` sorted by row
+    count descending so the dashboard's default selector points at the
+    predictor with the most data.
+    """
+    rows = conn.execute(
+        """
+        SELECT q.predictor_version, COUNT(*) AS n
+          FROM forecast_queue q
+          JOIN forecast_outcomes o USING (forecast_id)
+         WHERE q.predictor_version IS NOT NULL
+           AND q.status = 'resolved'
+           AND o.actual_total_seconds IS NOT NULL
+         GROUP BY q.predictor_version
+        HAVING COUNT(*) >= ?
+         ORDER BY n DESC
+        """,
+        [min_resolved],
+    ).fetchall()
+    return [(str(pv), int(n)) for pv, n in rows]
+
+
+def active_predictor_rows(
+    conn: duckdb.DuckDBPyConnection,
+) -> list[ActivePredictorRow]:
+    """Every row of ``predictor_active`` for dashboard display.
+
+    Returns an empty list (not None) when the table is empty or doesn't
+    exist yet, so the dashboard renders an explanatory placeholder
+    instead of crashing.
+    """
+    has = conn.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'predictor_active'"
+    ).fetchone()
+    if not has or not has[0]:
+        return []
+    rows = conn.execute(
+        """
+        SELECT corridor_id, predictor_version, decided_at, decided_score,
+               pending_candidate, COALESCE(pending_wins, 0), pending_score
+          FROM predictor_active
+         ORDER BY corridor_id
+        """
+    ).fetchall()
+    return [
+        ActivePredictorRow(
+            corridor_id=str(cid),
+            predictor_version=str(pv),
+            decided_at=da,
+            decided_score=(float(ds) if ds is not None else None),
+            pending_candidate=(str(pc) if pc else None),
+            pending_wins=int(pw or 0),
+            pending_score=(float(ps) if ps is not None else None),
+        )
+        for cid, pv, da, ds, pc, pw, ps in rows
     ]
 
 
