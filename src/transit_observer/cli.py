@@ -197,7 +197,8 @@ def calibration(bins: int) -> None:
 
 @cli.command()
 @click.option("--host", default="127.0.0.1", show_default=True)
-@click.option("--port", default=8000, show_default=True, type=int)
+@click.option("--port", default=8001, show_default=True, type=int,
+              help="Port 8000 is reserved for the sister divvy-observer service.")
 def api(host: str, port: int) -> None:
     """Run the HTTP prediction API. POST queries get logged for auto-promote."""
     import uvicorn

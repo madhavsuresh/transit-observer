@@ -26,7 +26,8 @@ Environment overrides (highest precedence):
 
 URLs:
   Dashboard:  http://127.0.0.1:8502
-  API:        http://127.0.0.1:8000      (swagger at /docs)
+  API:        http://127.0.0.1:8001      (swagger at /docs)
+              (8000 is reserved for the sister divvy-observer service)
 EOF
   exit 0
 fi
@@ -47,8 +48,8 @@ echo "==> starting collector"
 uv run python -m transit_observer.collector &
 COLLECTOR_PID=$!
 
-echo "==> starting API on http://127.0.0.1:8000 (docs at /docs)"
-uv run transit api --host 127.0.0.1 --port 8000 &
+echo "==> starting API on http://127.0.0.1:8001 (docs at /docs)"
+uv run transit api --host 127.0.0.1 --port 8001 &
 API_PID=$!
 
 echo "==> starting dashboard on http://127.0.0.1:8502"

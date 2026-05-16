@@ -181,7 +181,7 @@ def main() -> None:
     import uvicorn
     uvicorn.run(
         "transit_observer.api:app",
-        host="127.0.0.1", port=8000, reload=False,
+        host="127.0.0.1", port=8001, reload=False,
     )
 
 
