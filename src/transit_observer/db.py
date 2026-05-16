@@ -76,11 +76,14 @@ CREATE TABLE IF NOT EXISTS forecast_queue (
     enqueued_at              TIMESTAMPTZ NOT NULL,
     snapshot_polled_at       TIMESTAMPTZ NOT NULL,
     leave_at                 TIMESTAMPTZ NOT NULL,
-    line                     TEXT        NOT NULL,
+    mode                     TEXT NOT NULL DEFAULT 'L',  -- L | bus | metra | intercampus
+    line                     TEXT NOT NULL,              -- L line code / bus route / metra route_id / 'intercampus'
     direction_code           TEXT,
-    boarding_map_id          INTEGER     NOT NULL,
+    boarding_map_id          INTEGER NOT NULL DEFAULT 0, -- L only
+    boarding_text_id         TEXT,                       -- non-L modes use this
     boarding_station_name    TEXT,
-    alighting_map_id         INTEGER     NOT NULL,
+    alighting_map_id         INTEGER NOT NULL DEFAULT 0, -- L only
+    alighting_text_id        TEXT,                       -- non-L modes use this
     alighting_station_name   TEXT,
     predicted_wait_mean      DOUBLE,
     predicted_wait_p50       DOUBLE,
@@ -149,8 +152,55 @@ CREATE TABLE IF NOT EXISTS bus_predictions_raw (
 CREATE INDEX IF NOT EXISTS idx_bus_polled ON bus_predictions_raw(polled_at);
 CREATE INDEX IF NOT EXISTS idx_bus_route_stop ON bus_predictions_raw(route, stop_id);
 
+CREATE TABLE IF NOT EXISTS bus_runs_observed (
+    route               TEXT NOT NULL,
+    vehicle_id          TEXT NOT NULL,
+    stop_id             INTEGER NOT NULL,
+    destination_name    TEXT,
+    direction_name      TEXT,
+    observed_arrival_at TIMESTAMPTZ NOT NULL,
+    first_seen_at       TIMESTAMPTZ,
+    last_seen_at        TIMESTAMPTZ,
+    sample_count        INTEGER,
+    inferred_from       TEXT,
+    PRIMARY KEY (route, vehicle_id, stop_id, observed_arrival_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bus_runs_route_stop ON bus_runs_observed(route, stop_id);
+
+CREATE TABLE IF NOT EXISTS metra_trips_observed (
+    route_id            TEXT NOT NULL,
+    trip_id             TEXT NOT NULL,
+    station_id          TEXT NOT NULL,
+    direction_id        INTEGER,
+    observed_arrival_at TIMESTAMPTZ NOT NULL,
+    first_seen_at       TIMESTAMPTZ,
+    last_seen_at        TIMESTAMPTZ,
+    sample_count        INTEGER,
+    inferred_from       TEXT,
+    PRIMARY KEY (route_id, trip_id, station_id, observed_arrival_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_metra_trips_route_station ON metra_trips_observed(route_id, station_id);
+
+CREATE TABLE IF NOT EXISTS intercampus_trips_observed (
+    route_id            TEXT NOT NULL,
+    trip_id             TEXT NOT NULL,
+    stop_id             TEXT NOT NULL,
+    direction           TEXT,
+    observed_arrival_at TIMESTAMPTZ NOT NULL,
+    first_seen_at       TIMESTAMPTZ,
+    last_seen_at        TIMESTAMPTZ,
+    sample_count        INTEGER,
+    inferred_from       TEXT,
+    PRIMARY KEY (route_id, trip_id, stop_id, observed_arrival_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_intercampus_trips_stop ON intercampus_trips_observed(direction, stop_id);
+
 CREATE TABLE IF NOT EXISTS direction_audit (
     forecast_id                       TEXT PRIMARY KEY,
+    mode                              TEXT NOT NULL DEFAULT 'L',
     audited_at                        TIMESTAMPTZ NOT NULL,
     candidate_arrivals_count          INTEGER NOT NULL,
     kept_arrivals_count               INTEGER NOT NULL,

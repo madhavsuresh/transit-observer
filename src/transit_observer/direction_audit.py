@@ -61,14 +61,33 @@ def audit_resolved_forecast(
     *,
     forecast_id: str,
     now: datetime,
+    mode: str = "L",
+    outcome: dict | None = None,
 ) -> AuditResult | None:
     """Compute and persist an audit row for one resolved forecast.
 
-    Looks up the boarded run from `forecast_outcomes`, re-fetches the
-    arrivals the predictor saw at `boarding_map_id` around `leave_at`,
-    re-applies the direction filter the predictor used, compares to the
-    realized boarded run, and inserts into `direction_audit`.
+    Dispatches per `mode`. Each mode has a different idea of "direction":
+    - L: directionCode + destinationName at the boarding station
+    - bus: directionName + destinationName at the boarding stop
+    - metra: direction_id (0/1)
+    - intercampus: direction ('northbound' | 'southbound')
     """
+    if mode == "bus":
+        return _audit_bus(conn, forecast_id=forecast_id, now=now, outcome=outcome)
+    if mode == "metra":
+        return _audit_metra(conn, forecast_id=forecast_id, now=now, outcome=outcome)
+    if mode == "intercampus":
+        return _audit_intercampus(conn, forecast_id=forecast_id, now=now, outcome=outcome)
+    return _audit_l(conn, forecast_id=forecast_id, now=now, outcome=outcome)
+
+
+def _audit_l(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    forecast_id: str,
+    now: datetime,
+    outcome: dict | None,
+) -> AuditResult | None:
     row = conn.execute(
         """
         SELECT q.line, q.boarding_map_id, q.alighting_map_id,
@@ -165,29 +184,220 @@ def audit_resolved_forecast(
         kept_matching_boarded_direction=matching,
     )
 
+    _insert_audit(
+        conn,
+        forecast_id=forecast_id,
+        mode="L",
+        now=now,
+        candidate_count=candidate_count,
+        kept_count=len(kept),
+        kept_direction_codes=result.kept_direction_codes,
+        kept_destination_names=result.kept_destination_names,
+        boarded_direction_code=boarded_direction,
+        boarded_destination_name=boarded_destination,
+        boarded_was_kept=boarded_was_kept,
+        kept_matching_boarded_direction=matching,
+    )
+    return result
+
+
+def _audit_bus(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    forecast_id: str,
+    now: datetime,
+    outcome: dict | None,
+) -> AuditResult | None:
+    """For bus: keep arrivals whose direction_name matches the boarding stop's
+    direction_label (as the predictor does). Compare to the boarded vehicle's
+    direction_name."""
+    row = conn.execute(
+        """
+        SELECT q.line, q.boarding_text_id, q.direction_code, q.leave_at
+          FROM forecast_queue q
+         WHERE forecast_id = ?
+        """,
+        [forecast_id],
+    ).fetchone()
+    if row is None:
+        return None
+    route, boarding_text_id, expected_direction, leave_at = row
+    if boarding_text_id is None:
+        return None
+    boarding_stop_id = int(boarding_text_id)
+
+    candidate_rows = conn.execute(
+        """
+        SELECT direction_name, destination_name
+          FROM bus_predictions_raw
+         WHERE route = ? AND stop_id = ?
+           AND polled_at >= ? AND arrival_at >= ? AND arrival_at <= ?
+        """,
+        [route, boarding_stop_id, leave_at - timedelta(minutes=5), leave_at, leave_at + timedelta(minutes=45)],
+    ).fetchall()
+    candidate_count = len(candidate_rows)
+    target = (expected_direction or "").lower()
+    kept = [
+        (direction_name, destination)
+        for direction_name, destination in candidate_rows
+        if not target or (direction_name and direction_name.lower() == target)
+    ]
+    boarded_direction = (outcome or {}).get("boarded_direction_code")
+    boarded_destination = (outcome or {}).get("boarded_destination_name")
+    matching = sum(
+        1 for direction_name, _ in kept if direction_name and boarded_direction and direction_name == boarded_direction
+    )
+    boarded_was_kept = bool(boarded_direction) and any(
+        direction_name and direction_name == boarded_direction for direction_name, _ in kept
+    )
+    _insert_audit(
+        conn,
+        forecast_id=forecast_id,
+        mode="bus",
+        now=now,
+        candidate_count=candidate_count,
+        kept_count=len(kept),
+        kept_direction_codes=",".join(sorted({d for d, _ in kept if d})),
+        kept_destination_names=",".join(sorted({dest for _, dest in kept if dest})),
+        boarded_direction_code=boarded_direction,
+        boarded_destination_name=boarded_destination,
+        boarded_was_kept=boarded_was_kept,
+        kept_matching_boarded_direction=matching,
+    )
+    return AuditResult(
+        forecast_id=forecast_id,
+        candidate_arrivals_count=candidate_count,
+        kept_arrivals_count=len(kept),
+        kept_direction_codes=",".join(sorted({d for d, _ in kept if d})),
+        kept_destination_names=",".join(sorted({dest for _, dest in kept if dest})),
+        boarded_direction_code=boarded_direction,
+        boarded_destination_name=boarded_destination,
+        boarded_was_kept=boarded_was_kept,
+        kept_matching_boarded_direction=matching,
+    )
+
+
+def _audit_metra(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    forecast_id: str,
+    now: datetime,
+    outcome: dict | None,
+) -> AuditResult | None:
+    """For Metra: the predictor doesn't apply a destination filter — it
+    picks viable trips by trip_id join. Audit on direction_id (0/1)."""
+    row = conn.execute(
+        """
+        SELECT q.line, q.direction_code
+          FROM forecast_queue q WHERE forecast_id = ?
+        """,
+        [forecast_id],
+    ).fetchone()
+    if row is None:
+        return None
+    _, expected_direction = row
+    boarded_direction = (outcome or {}).get("boarded_direction_code")
+    boarded_was_kept = (
+        expected_direction is None
+        or boarded_direction is None
+        or str(boarded_direction) == str(expected_direction)
+    )
+    _insert_audit(
+        conn,
+        forecast_id=forecast_id,
+        mode="metra",
+        now=now,
+        candidate_count=1,
+        kept_count=1,
+        kept_direction_codes=str(expected_direction) if expected_direction is not None else "",
+        kept_destination_names="",
+        boarded_direction_code=str(boarded_direction) if boarded_direction is not None else None,
+        boarded_destination_name=(outcome or {}).get("boarded_destination_name"),
+        boarded_was_kept=boarded_was_kept,
+        kept_matching_boarded_direction=1 if boarded_was_kept else 0,
+    )
+    return None
+
+
+def _audit_intercampus(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    forecast_id: str,
+    now: datetime,
+    outcome: dict | None,
+) -> AuditResult | None:
+    """For Intercampus: the predictor restricts trips by direction
+    ('northbound' | 'southbound'). Audit by direction."""
+    row = conn.execute(
+        """
+        SELECT q.direction_code FROM forecast_queue q WHERE forecast_id = ?
+        """,
+        [forecast_id],
+    ).fetchone()
+    if row is None:
+        return None
+    expected_direction = row[0]
+    boarded_direction = (outcome or {}).get("boarded_direction_code")
+    boarded_was_kept = (
+        expected_direction is None
+        or boarded_direction is None
+        or str(boarded_direction).lower() == str(expected_direction).lower()
+    )
+    _insert_audit(
+        conn,
+        forecast_id=forecast_id,
+        mode="intercampus",
+        now=now,
+        candidate_count=1,
+        kept_count=1,
+        kept_direction_codes=str(expected_direction or ""),
+        kept_destination_names="",
+        boarded_direction_code=str(boarded_direction) if boarded_direction is not None else None,
+        boarded_destination_name=None,
+        boarded_was_kept=boarded_was_kept,
+        kept_matching_boarded_direction=1 if boarded_was_kept else 0,
+    )
+    return None
+
+
+def _insert_audit(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    forecast_id: str,
+    mode: str,
+    now: datetime,
+    candidate_count: int,
+    kept_count: int,
+    kept_direction_codes: str,
+    kept_destination_names: str,
+    boarded_direction_code: str | None,
+    boarded_destination_name: str | None,
+    boarded_was_kept: bool,
+    kept_matching_boarded_direction: int,
+) -> None:
     conn.execute(
         """
         INSERT INTO direction_audit (
-            forecast_id, audited_at, candidate_arrivals_count, kept_arrivals_count,
+            forecast_id, mode, audited_at, candidate_arrivals_count, kept_arrivals_count,
             kept_direction_codes, kept_destination_names,
             boarded_direction_code, boarded_destination_name,
             boarded_was_kept, kept_matching_boarded_direction, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (forecast_id) DO NOTHING
         """,
         [
-            forecast_id, now, candidate_count, len(kept),
-            result.kept_direction_codes, result.kept_destination_names,
-            boarded_direction, boarded_destination,
-            boarded_was_kept, matching, None,
+            forecast_id, mode, now, candidate_count, kept_count,
+            kept_direction_codes, kept_destination_names,
+            boarded_direction_code, boarded_destination_name,
+            boarded_was_kept, kept_matching_boarded_direction, None,
         ],
     )
-    return result
 
 
 @dataclass(frozen=True)
 class DirectionAuditSummary:
     line: str
+    mode: str
     n_audited: int
     recall_rate: float
     avg_direction_precision: float
@@ -200,7 +410,7 @@ def audit_summary(
 ) -> list[DirectionAuditSummary]:
     rows = conn.execute(
         """
-        SELECT q.line,
+        SELECT q.line, a.mode,
                COUNT(*) AS n,
                AVG(CASE WHEN a.boarded_was_kept THEN 1 ELSE 0 END) AS recall,
                AVG(
@@ -211,18 +421,19 @@ def audit_summary(
           FROM direction_audit a
           JOIN forecast_queue q USING (forecast_id)
          WHERE a.boarded_direction_code IS NOT NULL
-         GROUP BY q.line
+         GROUP BY q.line, a.mode
         HAVING n >= ?
-         ORDER BY q.line
+         ORDER BY a.mode, q.line
         """,
         [min_samples],
     ).fetchall()
     return [
         DirectionAuditSummary(
             line=line,
+            mode=mode,
             n_audited=n,
             recall_rate=recall or 0.0,
             avg_direction_precision=precision or 0.0,
         )
-        for line, n, recall, precision in rows
+        for line, mode, n, recall, precision in rows
     ]

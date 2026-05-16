@@ -1,10 +1,10 @@
-"""Find the realized train for each due forecast and write the outcome.
+"""Find the realized run for each due forecast across all modes.
 
-For a forecast: rider is "at" `boarding_map_id` at `leave_at`. We look at
-`train_runs_observed` and pick the first run on this line at this station
-with `observed_arrival_at >= leave_at` whose `destination` heads in the
-right direction. Then we find the same run's observed arrival at the
-alighting station.
+Dispatches per `forecast_queue.mode`:
+- L: existing logic against `train_runs_observed`
+- bus: against `bus_runs_observed`, keyed by vehicle_id
+- metra: against `metra_trips_observed`, keyed by trip_id
+- intercampus: against `intercampus_trips_observed`, keyed by trip_id
 
 Forecasts that can't be resolved by `resolve_after + buffer` are marked
 `unresolvable`.
@@ -19,7 +19,10 @@ from typing import Iterable
 
 import duckdb
 
+from .bus_predictor import resolve_bus_forecast
 from .direction_audit import audit_resolved_forecast
+from .intercampus_predictor import resolve_intercampus_forecast
+from .metra_predictor import resolve_metra_forecast
 
 log = logging.getLogger(__name__)
 
@@ -28,10 +31,13 @@ log = logging.getLogger(__name__)
 class _Forecast:
     forecast_id: str
     leave_at: datetime
+    mode: str
     line: str
     direction_code: str | None
     boarding_map_id: int
+    boarding_text_id: str | None
     alighting_map_id: int
+    alighting_text_id: str | None
     predicted_total_p50: float
     predicted_total_p80: float
     predicted_total_p90: float
@@ -50,8 +56,9 @@ def resolve_due_forecasts(
     """
     rows = conn.execute(
         """
-        SELECT forecast_id, leave_at, line, direction_code,
-               boarding_map_id, alighting_map_id,
+        SELECT forecast_id, leave_at, mode, line, direction_code,
+               boarding_map_id, boarding_text_id,
+               alighting_map_id, alighting_text_id,
                predicted_total_p50, predicted_total_p80, predicted_total_p90,
                resolve_after
           FROM forecast_queue
@@ -68,7 +75,7 @@ def resolve_due_forecasts(
 
     for raw in rows:
         forecast = _Forecast(*raw)
-        outcome = _resolve_one(conn, forecast, now=now)
+        outcome = _resolve_mode(conn, forecast, now=now)
         if outcome is None:
             cutoff = forecast.resolve_after + timedelta(seconds=expiration_buffer_seconds)
             if now >= cutoff:
@@ -92,18 +99,18 @@ def resolve_due_forecasts(
             [
                 forecast.forecast_id,
                 now,
-                outcome.run_number,
-                outcome.boarded_at,
-                outcome.alighted_at,
-                outcome.actual_wait_seconds,
-                outcome.actual_in_vehicle_seconds,
-                outcome.actual_total_seconds,
-                outcome.actual_total_seconds <= forecast.predicted_total_p80,
-                outcome.actual_total_seconds <= forecast.predicted_total_p90,
-                outcome.actual_total_seconds - forecast.predicted_total_p50,
-                outcome.actual_total_seconds - forecast.predicted_total_p80,
+                outcome["boarded_run_number"],
+                outcome["boarded_at"],
+                outcome["alighted_at"],
+                outcome["actual_wait_seconds"],
+                outcome["actual_in_vehicle_seconds"],
+                outcome["actual_total_seconds"],
+                outcome["actual_total_seconds"] <= forecast.predicted_total_p80,
+                outcome["actual_total_seconds"] <= forecast.predicted_total_p90,
+                outcome["actual_total_seconds"] - forecast.predicted_total_p50,
+                outcome["actual_total_seconds"] - forecast.predicted_total_p80,
                 False,
-                outcome.notes,
+                outcome.get("notes"),
             ],
         )
         conn.execute(
@@ -111,7 +118,13 @@ def resolve_due_forecasts(
             [forecast.forecast_id],
         )
         try:
-            audit_resolved_forecast(conn, forecast_id=forecast.forecast_id, now=now)
+            audit_resolved_forecast(
+                conn,
+                forecast_id=forecast.forecast_id,
+                now=now,
+                mode=forecast.mode,
+                outcome=outcome,
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("direction_audit.error", forecast_id=forecast.forecast_id, err=str(exc))
         n_resolved += 1
@@ -119,28 +132,52 @@ def resolve_due_forecasts(
     return n_resolved, n_unresolvable
 
 
-@dataclass(frozen=True)
-class _Outcome:
-    run_number: str
-    boarded_at: datetime
-    alighted_at: datetime
-    actual_wait_seconds: float
-    actual_in_vehicle_seconds: float
-    actual_total_seconds: float
-    notes: str
+def _resolve_mode(conn: duckdb.DuckDBPyConnection, f: _Forecast, *, now: datetime) -> dict | None:
+    if f.mode == "L":
+        return _resolve_l(conn, f, now=now)
+    if f.mode == "bus":
+        if f.boarding_text_id is None or f.alighting_text_id is None:
+            return None
+        return resolve_bus_forecast(
+            conn,
+            forecast_id=f.forecast_id,
+            leave_at=f.leave_at,
+            route=f.line,
+            boarding_stop_id=int(f.boarding_text_id),
+            alighting_stop_id=int(f.alighting_text_id),
+            now=now,
+        )
+    if f.mode == "metra":
+        if f.boarding_text_id is None or f.alighting_text_id is None:
+            return None
+        return resolve_metra_forecast(
+            conn,
+            forecast_id=f.forecast_id,
+            leave_at=f.leave_at,
+            route_id=f.line,
+            boarding_station_id=f.boarding_text_id,
+            alighting_station_id=f.alighting_text_id,
+            now=now,
+        )
+    if f.mode == "intercampus":
+        if f.boarding_text_id is None or f.alighting_text_id is None:
+            return None
+        return resolve_intercampus_forecast(
+            conn,
+            forecast_id=f.forecast_id,
+            leave_at=f.leave_at,
+            boarding_stop_id=f.boarding_text_id,
+            alighting_stop_id=f.alighting_text_id,
+            now=now,
+        )
+    log.warning("resolver.unknown_mode", mode=f.mode)
+    return None
 
 
-def _resolve_one(
-    conn: duckdb.DuckDBPyConnection,
-    f: _Forecast,
-    *,
-    now: datetime,
-) -> _Outcome | None:
-    """Find the run a rider arriving at `leave_at` would have boarded,
-    then look up that run's arrival at the alighting station."""
+def _resolve_l(conn: duckdb.DuckDBPyConnection, f: _Forecast, *, now: datetime) -> dict | None:
     boarding = conn.execute(
         """
-        SELECT run_number, observed_arrival_at, destination_name
+        SELECT run_number, observed_arrival_at, destination_name, direction_code
           FROM train_runs_observed
          WHERE line = ?
            AND map_id = ?
@@ -155,7 +192,7 @@ def _resolve_one(
     if not boarding:
         return None
 
-    for run_number, boarded_at, destination in boarding:
+    for run_number, boarded_at, destination, direction in boarding:
         alighting = conn.execute(
             """
             SELECT observed_arrival_at
@@ -174,16 +211,17 @@ def _resolve_one(
         alighted_at = alighting[0]
         actual_wait = (boarded_at - f.leave_at).total_seconds()
         actual_in_vehicle = (alighted_at - boarded_at).total_seconds()
-        actual_total = (alighted_at - f.leave_at).total_seconds()
         if actual_in_vehicle < 0:
             continue
-        return _Outcome(
-            run_number=run_number,
-            boarded_at=boarded_at,
-            alighted_at=alighted_at,
-            actual_wait_seconds=actual_wait,
-            actual_in_vehicle_seconds=actual_in_vehicle,
-            actual_total_seconds=actual_total,
-            notes=f"destination={destination or '?'}",
-        )
+        return {
+            "boarded_run_number": run_number,
+            "boarded_at": boarded_at,
+            "alighted_at": alighted_at,
+            "actual_wait_seconds": actual_wait,
+            "actual_in_vehicle_seconds": actual_in_vehicle,
+            "actual_total_seconds": (alighted_at - f.leave_at).total_seconds(),
+            "boarded_direction_code": direction,
+            "boarded_destination_name": destination,
+            "notes": f"destination={destination or '?'}",
+        }
     return None

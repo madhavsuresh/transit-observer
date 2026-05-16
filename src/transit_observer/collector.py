@@ -22,11 +22,24 @@ import structlog
 
 from . import db, trajectory
 from .bus_client import CTABusClient
+from .bus_predictor import build_observed_bus_runs, enqueue_bus_forecast, predict_bus_trip, sample_bus_trip
 from .catalog import LStation, load_catalog
 from .config import CHICAGO, Settings, settings
 from .cta_train_client import ArrivalRaw, CTATrainClient
 from .intercampus_client import IntercampusClient
+from .intercampus_predictor import (
+    build_observed_intercampus_trips,
+    enqueue_intercampus_forecast,
+    predict_intercampus_trip,
+    sample_intercampus_trip,
+)
 from .metra_client import MetraClient
+from .metra_predictor import (
+    build_observed_metra_trips,
+    enqueue_metra_forecast,
+    predict_metra_trip,
+    sample_metra_trip,
+)
 from .resolver import resolve_due_forecasts
 from .trip_generator import enqueue_forecast, predict_trip, sample_trip
 
@@ -100,12 +113,29 @@ async def run(stngs: Settings = settings) -> None:
                     last_intercampus_poll = tick_started
 
                 if (tick_started - last_trajectory).total_seconds() >= stngs.poll_interval_seconds * 4:
-                    written = trajectory.build_observed_runs(conn, now=tick_started)
-                    log.info("trajectory.built", rows=written)
+                    n_l = trajectory.build_observed_runs(conn, now=tick_started)
+                    n_bus = build_observed_bus_runs(conn, now=tick_started)
+                    n_metra = build_observed_metra_trips(conn, now=tick_started)
+                    n_ic = build_observed_intercampus_trips(conn, now=tick_started)
+                    log.info("trajectory.built", l=n_l, bus=n_bus, metra=n_metra, intercampus=n_ic)
                     last_trajectory = tick_started
 
                 if (tick_started - last_trip_gen).total_seconds() >= stngs.trip_generation_interval_seconds:
-                    n_enqueued = _generate_trips(conn, catalog, rng=rng, now=tick_started, count=stngs.trips_per_generation_tick)
+                    enabled_modes = ["L"]
+                    if bus_client:
+                        enabled_modes.append("bus")
+                    if metra_client:
+                        enabled_modes.append("metra")
+                    enabled_modes.append("intercampus")  # no key needed
+                    n_enqueued = _generate_trips_multimodal(
+                        conn,
+                        catalog=catalog,
+                        rng=rng,
+                        now=tick_started,
+                        count=stngs.trips_per_generation_tick,
+                        enabled_modes=enabled_modes,
+                        monitored_bus_stops=list(stngs.monitored_bus_stops),
+                    )
                     if n_enqueued:
                         log.info("trips.enqueued", n=n_enqueued)
                     last_trip_gen = tick_started
@@ -340,6 +370,68 @@ def _generate_trips(
         wait, in_vehicle = forecast
         enqueue_forecast(conn, spec=spec, wait=wait, in_vehicle=in_vehicle, now=now, snapshot_polled_at=now)
         n += 1
+    return n
+
+
+def _generate_trips_multimodal(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    catalog: list[LStation],
+    rng: random.Random,
+    now: datetime,
+    count: int,
+    enabled_modes: list[str],
+    monitored_bus_stops: list[tuple[str, int]],
+) -> int:
+    n = 0
+    for _ in range(count):
+        mode = rng.choice(enabled_modes)
+        if mode == "L":
+            spec = sample_trip(catalog, rng=rng, leave_at=now)
+            if spec is None:
+                continue
+            forecast = predict_trip(conn, spec, now=now)
+            if forecast is None:
+                continue
+            wait, in_vehicle = forecast
+            enqueue_forecast(conn, spec=spec, wait=wait, in_vehicle=in_vehicle, now=now, snapshot_polled_at=now)
+            n += 1
+        elif mode == "bus":
+            spec = sample_bus_trip(monitored_stops=monitored_bus_stops, rng=rng, leave_at=now)
+            if spec is None:
+                continue
+            forecast = predict_bus_trip(conn, spec, now=now)
+            if forecast is None:
+                continue
+            wait, in_vehicle = forecast
+            enqueue_bus_forecast(conn, spec=spec, wait=wait, in_vehicle=in_vehicle, now=now, snapshot_polled_at=now)
+            n += 1
+        elif mode == "metra":
+            spec = sample_metra_trip(rng=rng, leave_at=now)
+            if spec is None:
+                continue
+            forecast = predict_metra_trip(conn, spec, now=now)
+            if forecast is None:
+                continue
+            wait, in_vehicle, direction_id = forecast
+            enqueue_metra_forecast(
+                conn, spec=spec, wait=wait, in_vehicle=in_vehicle,
+                direction_id=direction_id, now=now, snapshot_polled_at=now,
+            )
+            n += 1
+        elif mode == "intercampus":
+            spec = sample_intercampus_trip(rng=rng, leave_at=now)
+            if spec is None:
+                continue
+            forecast = predict_intercampus_trip(conn, spec, now=now)
+            if forecast is None:
+                continue
+            wait, in_vehicle, direction = forecast
+            enqueue_intercampus_forecast(
+                conn, spec=spec, wait=wait, in_vehicle=in_vehicle,
+                direction=direction, now=now, snapshot_polled_at=now,
+            )
+            n += 1
     return n
 
 

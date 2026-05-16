@@ -32,18 +32,19 @@ uv sync
 export CTA_TRAIN_API_KEY=<your-cta-key>          # required
 export CTA_BUS_API_KEY=<your-bus-key>            # optional (skips bus poller if absent)
 export METRA_API_KEY=<your-metra-key>            # optional (skips Metra poller if absent)
-./run.sh                                         # collector + resolver in this terminal
+./run.sh                                         # collector + dashboard, foreground
 ```
 
-The single command starts:
+Dashboard at http://127.0.0.1:8501. The single command starts:
 
 - the **L collector** — round-robin polls `ttarrivals.aspx` across the L catalog (under CTA's 100-req-per-5-min limit) and writes raw arrivals to `train_arrivals_raw`. Also pulls `ttpositions.aspx` once per tick (1 req per line, 8 reqs/30s) into `train_positions_raw` as a stronger trajectory signal.
-- the **trajectory builder** — derives observed run-by-station arrivals from positions (preferred) and arrivals.
+- the **trajectory builders** — per mode, derive observed run/trip arrivals from raw data.
 - the **bus collector** — round-robin polls `getpredictions` for a configurable monitored-stop set (see `config.py`).
 - the **Metra collector** — pulls Metra GTFS-RT tripUpdates every 60s into `metra_arrivals_raw`.
 - the **Intercampus collector** — pulls Northwestern TripShot GTFS-RT every 60s into `intercampus_arrivals_raw` (no auth).
-- the **trip generator** (L only for now) — picks random (line, boarding, alighting) and enqueues a forecast.
-- the **resolver** — finds the realized run for each due forecast, writes the outcome, and runs the direction-filter audit on each resolved forecast.
+- the **multimodal trip generator** — each tick samples random (mode, route, boarding, alighting) trips. L picks any line+station pair; bus is constrained to the monitored set; Metra uses the station catalog; Intercampus uses the two-direction shuttle.
+- the **resolver** — dispatches per mode. Finds the realized run/trip/vehicle for each due forecast, writes the outcome, and runs the per-mode direction audit.
+- the **dashboard** — Streamlit app showing per-mode counts, coverage by corridor, residual scatterplot, and direction-filter audit table.
 
 DB lives at `data/transit_observer.duckdb` (writer) with `data/transit_observer_readonly.duckdb` as the 60s-refreshed read replica.
 
