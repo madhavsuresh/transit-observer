@@ -24,7 +24,8 @@ from typing import Iterable
 import duckdb
 import structlog
 
-from . import db, trajectory
+from . import db, query_log, trajectory
+from .auto_upgrade import promote_popular
 from .bus_client import CTABusClient
 from .bus_predictor import build_observed_bus_runs
 from .catalog import LStation, load_catalog
@@ -68,6 +69,8 @@ async def run(stngs: Settings = settings) -> None:
     last_bus_poll = datetime.now(CHICAGO)
     last_metra_poll = datetime.now(CHICAGO)
     last_intercampus_poll = datetime.now(CHICAGO)
+    last_query_import = datetime.now(CHICAGO)
+    last_promotion = datetime.now(CHICAGO)
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -144,6 +147,21 @@ async def run(stngs: Settings = settings) -> None:
                     if n_resolved or n_unresolvable:
                         log.info("forecasts.resolved", resolved=n_resolved, unresolvable=n_unresolvable)
                     last_resolver = tick_started
+
+                if (tick_started - last_query_import).total_seconds() >= stngs.query_import_interval_seconds:
+                    n_imported = query_log.import_pending(conn)
+                    if n_imported:
+                        log.info("queries.imported", n=n_imported)
+                    last_query_import = tick_started
+
+                if (tick_started - last_promotion).total_seconds() >= stngs.promotion_interval_seconds:
+                    promoted = promote_popular(
+                        conn, now=tick_started,
+                        min_count=stngs.promotion_min_count,
+                    )
+                    if promoted:
+                        log.info("corridors.promoted", n=len(promoted), ids=promoted)
+                    last_promotion = tick_started
 
                 if (tick_started - last_replica_refresh).total_seconds() >= stngs.read_replica_refresh_seconds:
                     db.refresh_read_replica()

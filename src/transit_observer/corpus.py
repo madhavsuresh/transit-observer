@@ -96,6 +96,101 @@ def _catalogs() -> _Catalogs:
     return _CATALOGS
 
 
+@dataclass(frozen=True)
+class AdHocPrediction:
+    """On-demand prediction for a single (mode, line, boarding, alighting).
+
+    Returned by ``predict_for_od``. Does **not** write to forecast_queue --
+    use this for live API queries where we want a prediction but don't
+    want to enqueue a graded forecast for every query.
+    """
+    mode: str
+    line: str
+    direction_code: str | None
+    boarding_label: str
+    alighting_label: str
+    predicted_wait_mean: float
+    predicted_wait_p50: float
+    predicted_wait_p80: float
+    predicted_wait_p90: float
+    predicted_in_vehicle_mean: float
+    predicted_total_p50: float
+    predicted_total_p80: float
+    predicted_total_p90: float
+    predictor_version: str
+
+
+def predict_for_od(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    mode: str,
+    line: str,
+    boarding_int_id: int = 0,
+    boarding_text_id: str | None = None,
+    alighting_int_id: int = 0,
+    alighting_text_id: str | None = None,
+    now: datetime,
+) -> AdHocPrediction | None:
+    """Run the per-mode predictor for an arbitrary OD pair and return the
+    prediction without persisting anything to forecast_queue.
+
+    The caller is responsible for logging the query separately if desired
+    (see ``query_log.append_query``).
+    """
+    cats = _catalogs()
+    pseudo = Corridor(
+        corridor_id="__adhoc__",
+        mode=mode,
+        line=line,
+        direction="",
+        origin_label="", origin_latitude=0.0, origin_longitude=0.0,
+        destination_label="", destination_latitude=0.0, destination_longitude=0.0,
+        boarding_int_id=boarding_int_id, boarding_text_id=boarding_text_id,
+        alighting_int_id=alighting_int_id, alighting_text_id=alighting_text_id,
+        schedule_headway_seconds=600.0, cadence_seconds=300.0, priority=99,
+    )
+    out = _predict(conn, pseudo, cats, now)
+    if out is None:
+        return None
+
+    if mode == "L":
+        spec, wait_forecast, in_vehicle = out
+        wait = wait_forecast.wait_distribution
+        boarding_label, alighting_label = spec.boarding.name, spec.alighting.name
+        direction = spec.direction_label
+    elif mode == "bus":
+        spec, wait_forecast, in_vehicle = out
+        wait = wait_forecast.wait_distribution
+        boarding_label, alighting_label = spec.boarding.name, spec.alighting.name
+        direction = spec.boarding.direction_label
+    elif mode == "metra":
+        spec, wait, in_vehicle, direction_id = out
+        boarding_label, alighting_label = spec.boarding.name, spec.alighting.name
+        direction = str(direction_id) if direction_id is not None else None
+    elif mode == "intercampus":
+        spec, wait, in_vehicle, direction = out
+        boarding_label, alighting_label = spec.boarding.name, spec.alighting.name
+    else:
+        return None
+
+    return AdHocPrediction(
+        mode=mode,
+        line=line,
+        direction_code=direction,
+        boarding_label=boarding_label,
+        alighting_label=alighting_label,
+        predicted_wait_mean=wait.mean,
+        predicted_wait_p50=wait.p50,
+        predicted_wait_p80=wait.p80,
+        predicted_wait_p90=wait.p90,
+        predicted_in_vehicle_mean=in_vehicle.mean,
+        predicted_total_p50=wait.p50 + in_vehicle.p50,
+        predicted_total_p80=wait.p80 + in_vehicle.p80,
+        predicted_total_p90=wait.p90 + in_vehicle.p90,
+        predictor_version=PREDICTOR_VERSION,
+    )
+
+
 def predict_and_enqueue_corridor(
     conn: duckdb.DuckDBPyConnection,
     corridor: Corridor,

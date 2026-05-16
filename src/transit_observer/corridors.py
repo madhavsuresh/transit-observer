@@ -442,6 +442,203 @@ SEED_CORRIDORS: tuple[Corridor, ...] = (
         alighting_int_id=17349, alighting_text_id=None,
         schedule_headway_seconds=420.0, cadence_seconds=300.0, priority=4,
     ),
+
+    # === INTERMEDIATE CORRIDORS ===
+    # Mid-line OD pairs picked for transfer relevance + station ridership.
+    # Lower priority than the endpoint corridors above so endpoints are
+    # always predicted first when poll budget is tight.
+
+    # Red Line intermediates
+    Corridor(
+        corridor_id="cta-red-fullerton-roosevelt-sb",
+        mode="L", line="Red", direction="southbound",
+        origin_label="Fullerton", origin_latitude=41.9251, origin_longitude=-87.6529,
+        destination_label="Roosevelt", destination_latitude=41.8674, destination_longitude=-87.6274,
+        boarding_int_id=41220, boarding_text_id=None,
+        alighting_int_id=41400, alighting_text_id=None,
+        schedule_headway_seconds=540.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-red-fullerton-roosevelt-nb",
+        mode="L", line="Red", direction="northbound",
+        origin_label="Roosevelt", origin_latitude=41.8674, origin_longitude=-87.6274,
+        destination_label="Fullerton", destination_latitude=41.9251, destination_longitude=-87.6529,
+        boarding_int_id=41400, boarding_text_id=None,
+        alighting_int_id=41220, alighting_text_id=None,
+        schedule_headway_seconds=540.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-red-wilson-chicago-sb",
+        mode="L", line="Red", direction="southbound",
+        origin_label="Wilson", origin_latitude=41.9643, origin_longitude=-87.6576,
+        destination_label="Chicago", destination_latitude=41.8967, destination_longitude=-87.6282,
+        boarding_int_id=40540, boarding_text_id=None,
+        alighting_int_id=41450, alighting_text_id=None,
+        schedule_headway_seconds=540.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-red-wilson-chicago-nb",
+        mode="L", line="Red", direction="northbound",
+        origin_label="Chicago", origin_latitude=41.8967, origin_longitude=-87.6282,
+        destination_label="Wilson", destination_latitude=41.9643, destination_longitude=-87.6576,
+        boarding_int_id=41450, boarding_text_id=None,
+        alighting_int_id=40540, alighting_text_id=None,
+        schedule_headway_seconds=540.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-red-roosevelt-79th-sb",
+        mode="L", line="Red", direction="southbound",
+        origin_label="Roosevelt", origin_latitude=41.8674, origin_longitude=-87.6274,
+        destination_label="79th", destination_latitude=41.7504, destination_longitude=-87.6251,
+        boarding_int_id=41400, boarding_text_id=None,
+        alighting_int_id=40240, alighting_text_id=None,
+        schedule_headway_seconds=540.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-red-roosevelt-79th-nb",
+        mode="L", line="Red", direction="northbound",
+        origin_label="79th", origin_latitude=41.7504, origin_longitude=-87.6251,
+        destination_label="Roosevelt", destination_latitude=41.8674, destination_longitude=-87.6274,
+        boarding_int_id=40240, boarding_text_id=None,
+        alighting_int_id=41400, alighting_text_id=None,
+        schedule_headway_seconds=540.0, cadence_seconds=300.0, priority=5,
+    ),
+
+    # Blue Line intermediates
+    Corridor(
+        corridor_id="cta-blue-jefferson-loop-eb",
+        mode="L", line="Blue", direction="eastbound",
+        origin_label="Jefferson Park", origin_latitude=41.9706, origin_longitude=-87.7609,
+        destination_label="Clark/Lake", destination_latitude=41.8857, destination_longitude=-87.6309,
+        boarding_int_id=41280, boarding_text_id=None,
+        alighting_int_id=40380, alighting_text_id=None,
+        schedule_headway_seconds=600.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-blue-jefferson-loop-wb",
+        mode="L", line="Blue", direction="westbound",
+        origin_label="Clark/Lake", origin_latitude=41.8857, origin_longitude=-87.6309,
+        destination_label="Jefferson Park", destination_latitude=41.9706, destination_longitude=-87.7609,
+        boarding_int_id=40380, boarding_text_id=None,
+        alighting_int_id=41280, alighting_text_id=None,
+        schedule_headway_seconds=600.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-blue-logan-loop-eb",
+        mode="L", line="Blue", direction="eastbound",
+        origin_label="Logan Square", origin_latitude=41.9297, origin_longitude=-87.7085,
+        destination_label="Clark/Lake", destination_latitude=41.8857, destination_longitude=-87.6309,
+        boarding_int_id=41020, boarding_text_id=None,
+        alighting_int_id=40380, alighting_text_id=None,
+        schedule_headway_seconds=600.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-blue-logan-loop-wb",
+        mode="L", line="Blue", direction="westbound",
+        origin_label="Clark/Lake", origin_latitude=41.8857, origin_longitude=-87.6309,
+        destination_label="Logan Square", destination_latitude=41.9297, destination_longitude=-87.7085,
+        boarding_int_id=40380, boarding_text_id=None,
+        alighting_int_id=41020, alighting_text_id=None,
+        schedule_headway_seconds=600.0, cadence_seconds=300.0, priority=5,
+    ),
+
+    # Brown Line intermediate
+    Corridor(
+        corridor_id="cta-brown-western-mart-sb",
+        mode="L", line="Brn", direction="southbound",
+        origin_label="Western (Brown)", origin_latitude=41.9662, origin_longitude=-87.6885,
+        destination_label="Merchandise Mart", destination_latitude=41.8890, destination_longitude=-87.6339,
+        boarding_int_id=41480, boarding_text_id=None,
+        alighting_int_id=40460, alighting_text_id=None,
+        schedule_headway_seconds=600.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-brown-western-mart-nb",
+        mode="L", line="Brn", direction="northbound",
+        origin_label="Merchandise Mart", origin_latitude=41.8890, origin_longitude=-87.6339,
+        destination_label="Western (Brown)", destination_latitude=41.9662, destination_longitude=-87.6885,
+        boarding_int_id=40460, boarding_text_id=None,
+        alighting_int_id=41480, alighting_text_id=None,
+        schedule_headway_seconds=600.0, cadence_seconds=300.0, priority=5,
+    ),
+
+    # Green Line intermediates
+    Corridor(
+        corridor_id="cta-green-garfield-roosevelt-nb",
+        mode="L", line="G", direction="northbound",
+        origin_label="Garfield (Green)", origin_latitude=41.7952, origin_longitude=-87.6183,
+        destination_label="Roosevelt", destination_latitude=41.8674, destination_longitude=-87.6274,
+        boarding_int_id=40510, boarding_text_id=None,
+        alighting_int_id=41400, alighting_text_id=None,
+        schedule_headway_seconds=900.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-green-garfield-roosevelt-sb",
+        mode="L", line="G", direction="southbound",
+        origin_label="Roosevelt", origin_latitude=41.8674, origin_longitude=-87.6274,
+        destination_label="Garfield (Green)", destination_latitude=41.7952, destination_longitude=-87.6183,
+        boarding_int_id=41400, boarding_text_id=None,
+        alighting_int_id=40510, alighting_text_id=None,
+        schedule_headway_seconds=900.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-green-ashland-loop-eb",
+        mode="L", line="G", direction="eastbound",
+        origin_label="Ashland (Green)", origin_latitude=41.8853, origin_longitude=-87.6670,
+        destination_label="Clark/Lake", destination_latitude=41.8857, destination_longitude=-87.6309,
+        boarding_int_id=40170, boarding_text_id=None,
+        alighting_int_id=40380, alighting_text_id=None,
+        schedule_headway_seconds=600.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-green-ashland-loop-wb",
+        mode="L", line="G", direction="westbound",
+        origin_label="Clark/Lake", origin_latitude=41.8857, origin_longitude=-87.6309,
+        destination_label="Ashland (Green)", destination_latitude=41.8853, destination_longitude=-87.6670,
+        boarding_int_id=40380, boarding_text_id=None,
+        alighting_int_id=40170, alighting_text_id=None,
+        schedule_headway_seconds=600.0, cadence_seconds=300.0, priority=5,
+    ),
+
+    # Orange Line intermediate
+    Corridor(
+        corridor_id="cta-orange-pulaski-loop-nb",
+        mode="L", line="Org", direction="northbound",
+        origin_label="Pulaski (Orange)", origin_latitude=41.7998, origin_longitude=-87.7245,
+        destination_label="Clark/Lake", destination_latitude=41.8857, destination_longitude=-87.6309,
+        boarding_int_id=40960, boarding_text_id=None,
+        alighting_int_id=40380, alighting_text_id=None,
+        schedule_headway_seconds=600.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-orange-pulaski-loop-sb",
+        mode="L", line="Org", direction="southbound",
+        origin_label="Clark/Lake", origin_latitude=41.8857, origin_longitude=-87.6309,
+        destination_label="Pulaski (Orange)", destination_latitude=41.7998, destination_longitude=-87.7245,
+        boarding_int_id=40380, boarding_text_id=None,
+        alighting_int_id=40960, alighting_text_id=None,
+        schedule_headway_seconds=600.0, cadence_seconds=300.0, priority=5,
+    ),
+
+    # Pink Line intermediate
+    Corridor(
+        corridor_id="cta-pink-polk-loop-eb",
+        mode="L", line="Pink", direction="eastbound",
+        origin_label="Polk", origin_latitude=41.8716, origin_longitude=-87.6695,
+        destination_label="Clark/Lake", destination_latitude=41.8857, destination_longitude=-87.6309,
+        boarding_int_id=41030, boarding_text_id=None,
+        alighting_int_id=40380, alighting_text_id=None,
+        schedule_headway_seconds=900.0, cadence_seconds=300.0, priority=5,
+    ),
+    Corridor(
+        corridor_id="cta-pink-polk-loop-wb",
+        mode="L", line="Pink", direction="westbound",
+        origin_label="Clark/Lake", origin_latitude=41.8857, origin_longitude=-87.6309,
+        destination_label="Polk", destination_latitude=41.8716, destination_longitude=-87.6695,
+        boarding_int_id=40380, boarding_text_id=None,
+        alighting_int_id=41030, alighting_text_id=None,
+        schedule_headway_seconds=900.0, cadence_seconds=300.0, priority=5,
+    ),
 )
 
 
