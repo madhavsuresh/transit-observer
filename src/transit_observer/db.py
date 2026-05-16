@@ -328,18 +328,22 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
 # Schema migrations for tables that may pre-date a newer column.
 # DuckDB doesn't have CREATE COLUMN IF NOT EXISTS, so we probe pragma_table_info
 # and skip when the column already exists. Cheap to run on every startup.
-_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
-    ("forecast_queue", "corridor_id",        "TEXT"),
-    ("forecast_queue", "predictor_version",  "TEXT"),
-    ("forecast_queue", "feature_json",       "TEXT"),
-    ("forecast_outcomes", "truth_confidence", "DOUBLE"),
-    ("corridors", "source",                  "TEXT NOT NULL DEFAULT 'seed'"),
-    ("corridors", "promoted_from_query_count", "INTEGER"),
+# (table, column, type, backfill_expression).
+# DuckDB rejects constraints (NOT NULL, DEFAULT) on ALTER TABLE ADD COLUMN, so
+# we add the column unconstrained and run a separate UPDATE to backfill any
+# NULL rows when a default is needed.
+_MIGRATIONS: tuple[tuple[str, str, str, str | None], ...] = (
+    ("forecast_queue", "corridor_id",        "TEXT",    None),
+    ("forecast_queue", "predictor_version",  "TEXT",    None),
+    ("forecast_queue", "feature_json",       "TEXT",    None),
+    ("forecast_outcomes", "truth_confidence", "DOUBLE", None),
+    ("corridors", "source",                  "TEXT",    "'seed'"),
+    ("corridors", "promoted_from_query_count", "INTEGER", None),
 )
 
 
 def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
-    for table, column, ctype in _MIGRATIONS:
+    for table, column, ctype, backfill in _MIGRATIONS:
         existing = {
             row[0]
             for row in conn.execute(
@@ -349,6 +353,10 @@ def _migrate(conn: duckdb.DuckDBPyConnection) -> None:
         if column in existing:
             continue
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}")
+        if backfill is not None:
+            conn.execute(
+                f"UPDATE {table} SET {column} = {backfill} WHERE {column} IS NULL"
+            )
 
 
 def refresh_read_replica() -> None:

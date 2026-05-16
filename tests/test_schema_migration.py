@@ -122,6 +122,61 @@ def test_corridor_id_index_works_after_migration(pr1_db_path):
         conn.close()
 
 
+def test_alter_column_uses_no_constraints(pr1_db_path):
+    """Regression: DuckDB rejects ``ADD COLUMN col TYPE NOT NULL DEFAULT x``.
+    Migrations must add the column unconstrained, then backfill with a
+    separate UPDATE."""
+    # Make a DB that already has the corridors table from the corpus PR --
+    # so when we run init_schema, the migration for `source` actually runs.
+    conn = duckdb.connect(pr1_db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE corridors (
+                corridor_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                line TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                origin_label TEXT NOT NULL,
+                origin_latitude DOUBLE NOT NULL,
+                origin_longitude DOUBLE NOT NULL,
+                destination_label TEXT NOT NULL,
+                destination_latitude DOUBLE NOT NULL,
+                destination_longitude DOUBLE NOT NULL,
+                boarding_int_id INTEGER NOT NULL DEFAULT 0,
+                boarding_text_id TEXT,
+                alighting_int_id INTEGER NOT NULL DEFAULT 0,
+                alighting_text_id TEXT,
+                schedule_headway_seconds DOUBLE NOT NULL,
+                cadence_seconds DOUBLE NOT NULL DEFAULT 300,
+                priority INTEGER NOT NULL DEFAULT 5,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                seeded_at TIMESTAMPTZ NOT NULL,
+                last_predicted_at TIMESTAMPTZ
+            )
+            """
+        )
+        # Insert a row before the migration so we can verify backfill.
+        from datetime import datetime, timezone
+        conn.execute(
+            "INSERT INTO corridors VALUES (?, 'L', 'Red', 'southbound', "
+            "'A', 0.0, 0.0, 'B', 0.0, 0.0, 0, NULL, 0, NULL, 600, 300, 5, TRUE, ?, NULL)",
+            ["pre-existing", datetime.now(timezone.utc)],
+        )
+
+        # Should not raise even though `source` and `promoted_from_query_count`
+        # both need adding.
+        db.init_schema(conn)
+
+        # Backfill applied.
+        src = conn.execute(
+            "SELECT source FROM corridors WHERE corridor_id = ?", ["pre-existing"]
+        ).fetchone()[0]
+        assert src == "seed"
+    finally:
+        conn.close()
+
+
 def test_init_schema_on_empty_db_is_clean():
     """Sanity: fresh DB still works (no tables to migrate)."""
     tmpdir = tempfile.mkdtemp()
