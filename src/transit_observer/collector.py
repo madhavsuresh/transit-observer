@@ -53,6 +53,7 @@ async def run(stngs: Settings = settings) -> None:
 
     catalog = load_catalog()
     log.info("collector.startup", stations=len(catalog), poll_interval=stngs.poll_interval_seconds)
+    _log_acceleration_backends()
 
     client = CTATrainClient(stngs.cta_train_api_key)
     bus_client = CTABusClient(stngs.cta_bus_api_key) if stngs.cta_bus_api_key else None
@@ -405,6 +406,46 @@ def _generate_corridor_predictions(
         if result is not None:
             n += 1
     return n
+
+
+def _log_acceleration_backends() -> None:
+    """Surface which hardware-accelerated backends are wired up.
+
+    Run once at collector startup so the operator can verify the right
+    BLAS / threading is engaged. Pure diagnostic — never raises.
+    """
+    import os as _os
+    import platform
+
+    info: dict[str, str] = {
+        "machine": platform.machine(),
+        "system": platform.system(),
+        "cpu_count": str(_os.cpu_count() or 0),
+    }
+    try:
+        import numpy as np  # type: ignore
+        info["numpy"] = np.__version__
+        # Detect Apple Accelerate vs OpenBLAS via the build dep dict
+        cfg = np.__config__.show(mode="dicts")
+        blas_name = cfg.get("Build Dependencies", {}).get("blas", {}).get("name") or "unknown"
+        info["numpy_blas"] = blas_name
+    except Exception:  # noqa: BLE001
+        info["numpy"] = "missing"
+    try:
+        import duckdb as _duckdb  # type: ignore
+        # Probe threads from a temporary connection (don't reuse a writer)
+        c = _duckdb.connect(":memory:")
+        info["duckdb_threads"] = str(c.execute("SELECT current_setting('threads')").fetchone()[0])
+        info["duckdb"] = _duckdb.__version__
+        c.close()
+    except Exception:  # noqa: BLE001
+        info["duckdb"] = "missing"
+    try:
+        import lightgbm as _lgb  # type: ignore
+        info["lightgbm"] = _lgb.__version__
+    except Exception:  # noqa: BLE001
+        info["lightgbm"] = "not_installed"
+    log.info("acceleration.backends", **info)
 
 
 def _maybe_train(

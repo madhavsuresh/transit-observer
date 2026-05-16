@@ -7,6 +7,7 @@ which the collector refreshes every ``read_replica_refresh_seconds``.
 
 from __future__ import annotations
 
+import os
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
@@ -358,7 +359,14 @@ CREATE INDEX IF NOT EXISTS idx_outcomes_predictor
 
 def connect(path: Path | None = None, read_only: bool = False) -> duckdb.DuckDBPyConnection:
     target = path or settings.db_path
-    return duckdb.connect(str(target), read_only=read_only)
+    conn = duckdb.connect(str(target), read_only=read_only)
+    # Pin DuckDB to all available cores. The default is already
+    # ``cpu_count()`` on most platforms, but being explicit defends
+    # against shells / sandboxes that drop ``OMP_NUM_THREADS=1`` or
+    # similar. Cheap to set on every connection.
+    cpu = os.cpu_count() or 4
+    conn.execute(f"PRAGMA threads = {cpu}")
+    return conn
 
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:

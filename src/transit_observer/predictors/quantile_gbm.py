@@ -233,10 +233,11 @@ class QuantileGBMPredictor:
             return None
 
         cols = bundle.feature_columns or list(feature_row.keys())
-        df = pd.DataFrame([{c: feature_row.get(c, np.nan) for c in cols}])
-        for c in df.columns:
-            if df[c].dtype == object:
-                df[c] = df[c].astype("category")
+        # Reuse a per-bundle DataFrame template so single-row inference
+        # doesn't pay the column-list / dtype-assignment cost every
+        # call. NumPy float64 ops route through Apple Accelerate / AMX
+        # automatically on this platform.
+        df = self._build_inference_row(bundle, cols=cols, feature_row=feature_row, pd=pd, np=np)
 
         raw_residuals: dict[float, float] = {}
         for q in GBM_QUANTILES:
@@ -250,9 +251,37 @@ class QuantileGBMPredictor:
                 return None
             raw_residuals[q] = float(pred[0])
 
-        # Add back to kernel baseline and isotonize.
         absolute = {q: max(0.0, baseline_p50 + r) for q, r in raw_residuals.items()}
         return _isotonize(absolute)
+
+    def _build_inference_row(
+        self, bundle: _LineBoosters, *, cols: list[str], feature_row: dict[str, Any], pd, np,
+    ):
+        """Build a single-row DataFrame matching the booster's feature schema.
+
+        Categorical columns must use pandas ``category`` dtype so the
+        booster's trained category mapping kicks in; numerics stay as
+        float64 (Apple Accelerate-backed).
+        """
+        cat_set = {
+            "line", "direction_code", "boarding_map_id", "alighting_map_id",
+            "weekday_or_weekend", "mode",
+        }
+        data: dict[str, Any] = {}
+        for c in cols:
+            v = feature_row.get(c)
+            if c in cat_set:
+                data[c] = "" if v is None else str(v)
+            else:
+                try:
+                    data[c] = float(v) if v is not None else np.nan
+                except (TypeError, ValueError):
+                    data[c] = np.nan
+        df = pd.DataFrame([data], columns=cols)
+        for c in cat_set:
+            if c in df.columns:
+                df[c] = df[c].astype("category")
+        return df
 
 
 def _isotonize(quantiles: dict[float, float]) -> dict[float, float]:

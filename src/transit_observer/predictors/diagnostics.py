@@ -22,6 +22,8 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+import numpy as np
+
 
 def pinball_loss(actual: float, predicted: float, quantile: float) -> float:
     """Standard pinball / quantile loss.
@@ -67,6 +69,67 @@ def crps_from_quantiles(
     crps += alphas[0] * losses[0]
     crps += (1.0 - alphas[-1]) * losses[-1]
     return 2.0 * crps
+
+
+def crps_from_quantiles_batch(
+    *,
+    quantile_levels: np.ndarray,
+    quantile_values: np.ndarray,
+    actuals: np.ndarray,
+) -> np.ndarray:
+    """Vectorized CRPS over many rows.
+
+    Same formula as :func:`crps_from_quantiles` (Laio & Tamea 2007
+    trapezoid), implemented as one BLAS-backed reduction so a 100k-row
+    scoring pass is sub-second instead of seconds in a Python loop.
+
+    Args:
+        quantile_levels: 1-D float array of α values, shape ``(k,)``, in
+            ``(0, 1)``. Need not be sorted — sorted internally.
+        quantile_values: float array of predicted quantiles, shape
+            ``(n, k)`` aligned with ``quantile_levels``.
+        actuals: 1-D float array of realized outcomes, shape ``(n,)``.
+
+    Returns:
+        1-D array of per-row CRPS, shape ``(n,)``. NaN entries pass
+        through.
+    """
+    alphas = np.asarray(quantile_levels, dtype=np.float64)
+    qv = np.asarray(quantile_values, dtype=np.float64)
+    y = np.asarray(actuals, dtype=np.float64)
+
+    if alphas.ndim != 1 or qv.ndim != 2 or y.ndim != 1:
+        raise ValueError(
+            f"shape mismatch: alphas{alphas.shape}, qv{qv.shape}, y{y.shape}"
+        )
+    if qv.shape != (y.shape[0], alphas.shape[0]):
+        raise ValueError(
+            f"quantile_values must be (n, k) = ({y.shape[0]}, {alphas.shape[0]}); "
+            f"got {qv.shape}"
+        )
+
+    order = np.argsort(alphas)
+    alphas_s = alphas[order]
+    qv_s = qv[:, order]
+
+    # Pinball loss at each (row, quantile)
+    err = y[:, None] - qv_s
+    pos = np.maximum(0.0, err)
+    neg = np.maximum(0.0, -err)
+    losses = alphas_s[None, :] * pos + (1.0 - alphas_s[None, :]) * neg
+
+    # Trapezoid integration across quantile axis
+    dx = np.diff(alphas_s)
+    inner = (losses[:, :-1] + losses[:, 1:]) * 0.5 * dx[None, :]
+    inner_sum = inner.sum(axis=1)
+    # Boundary constant extensions to α=0 and α=1
+    boundary = alphas_s[0] * losses[:, 0] + (1.0 - alphas_s[-1]) * losses[:, -1]
+    crps = 2.0 * (inner_sum + boundary)
+
+    # Propagate NaNs from inputs
+    nan_rows = ~np.isfinite(y) | ~np.isfinite(qv_s).all(axis=1)
+    crps[nan_rows] = np.nan
+    return crps
 
 
 def interval_score(
