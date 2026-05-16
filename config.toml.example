@@ -1,0 +1,11 @@
+# Template for transit-observer config.toml.
+# Copy to config.toml and fill in real values, OR run `uv run transit setup`
+# for an interactive prompt.
+#
+# Environment variables override these values when set:
+#   CTA_TRAIN_API_KEY, CTA_BUS_API_KEY, METRA_API_KEY
+
+[api_keys]
+cta_train = ""   # required — https://www.transitchicago.com/developers/traintrackerapply/
+cta_bus = ""     # optional — https://www.transitchicago.com/developers/bustracker/
+metra = ""       # optional — https://metra.com/gtfs-realtime-api-key-request-license-agreement

@@ -1,0 +1,44 @@
+[project]
+name = "transit-observer"
+version = "0.1.0"
+description = "Long-running observatory for CTA L predictions: collects arrivals, validates departure-ladder kernels against realized outcomes."
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.7.0",
+    "uvicorn>=0.30.0",
+    "fastapi>=0.110.0",
+    "structlog>=24.0",
+    "click>=8.1",
+    "pytz>=2024.1",
+    "gtfs-realtime-bindings>=1.0",
+    "streamlit>=1.36",
+    "pandas>=2.0",
+    "altair>=5.0",
+]
+
+[project.scripts]
+transit = "transit_observer.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/transit_observer"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+markers = [
+    "live: tests that hit the live CTA API; require CTA_TRAIN_API_KEY and a network",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+]
