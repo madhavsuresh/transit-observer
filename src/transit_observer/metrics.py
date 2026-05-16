@@ -26,6 +26,15 @@ from .journey.quantile_distribution import (
     pit_value,
     fit_lognormal_from_p50_p80,
 )
+from .predictors.diagnostics import (
+    aggregate_coverage,
+    aggregate_crps,
+    coverage_gap,
+    crps_from_quantiles,
+    decision_score,
+    interval_score,
+    pinball_loss,
+)
 
 
 @dataclass(frozen=True)
@@ -796,6 +805,138 @@ def corpus_summary(
             cov80, median_resid, median_tc, last_at,
         ) in rows
     ]
+
+
+@dataclass(frozen=True)
+class PredictorScore:
+    """Per-(predictor, line, direction) rollup used by the registry's promote()."""
+    predictor_version: str
+    line: str
+    direction_code: str
+    n: int
+    crps: float
+    pinball_q50: float
+    pinball_q80: float
+    pinball_q90: float
+    coverage_p80: float
+    coverage_p90: float
+    coverage_gap_p80: float
+    tail_miss_p90_rate: float       # empirical P(actual > p90); nominal = 0.1
+    interval_score_p50_p90: float   # 40% interval score (Winkler at α=0.5)
+    decision_loss: float
+
+
+def crps_per_predictor(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    mode: str = "L",
+    since: datetime | None = None,
+    min_truth_confidence: float = 0.5,
+    min_samples: int = 30,
+) -> list[PredictorScore]:
+    """Per-(predictor, line, direction) probabilistic-scoring rollup.
+
+    Returns one row per (predictor_version, line, direction_code) bucket
+    with ≥ ``min_samples`` resolved outcomes. Used by the registry to
+    decide promotions and by ``transit train evaluate``.
+
+    Probabilistic scores (CRPS, interval score, etc.) are computed in
+    Python from the stored quantile triple so they work uniformly across
+    the heuristic kernel (lognormal-fit quantiles) and the learned GBM
+    (empirical pinball quantiles).
+    """
+    sql = """
+        SELECT q.predictor_version, q.line, COALESCE(q.direction_code, '') AS direction_code,
+               q.predicted_total_p50, q.predicted_total_p80, q.predicted_total_p90,
+               o.actual_total_seconds
+          FROM forecast_queue q
+          JOIN forecast_outcomes o USING (forecast_id)
+         WHERE q.mode = ?
+           AND q.status = 'resolved'
+           AND q.predictor_version IS NOT NULL
+           AND q.predicted_total_p50 > 0
+           AND q.predicted_total_p80 >= q.predicted_total_p50
+           AND o.actual_total_seconds IS NOT NULL
+           AND COALESCE(o.truth_confidence, 0) >= ?
+    """
+    params: list = [mode, min_truth_confidence]
+    if since is not None:
+        sql += " AND o.resolved_at >= ?"
+        params.append(since)
+    rows = conn.execute(sql, params).fetchall()
+
+    grouped: dict[tuple[str, str, str], list[tuple[float, float, float, float]]] = {}
+    for pv, line, direction, p50, p80, p90, actual in rows:
+        if pv is None:
+            continue
+        grouped.setdefault((pv, line, direction), []).append(
+            (float(p50), float(p80), float(p90), float(actual))
+        )
+
+    out: list[PredictorScore] = []
+    for (pv, line, direction), items in grouped.items():
+        if len(items) < min_samples:
+            continue
+        crps_vals: list[float] = []
+        pin50, pin80, pin90 = [], [], []
+        cov80, cov90 = [], []
+        tail_misses: list[bool] = []
+        intervals: list[float] = []
+        for p50, p80, p90, actual in items:
+            quantiles = {0.5: p50, 0.8: p80, 0.9: p90}
+            crps_vals.append(crps_from_quantiles(quantiles, actual))
+            pin50.append(pinball_loss(actual, p50, 0.5))
+            pin80.append(pinball_loss(actual, p80, 0.8))
+            pin90.append(pinball_loss(actual, p90, 0.9))
+            cov80.append(actual <= p80)
+            cov90.append(actual <= p90)
+            tail_misses.append(actual > p90)
+            intervals.append(interval_score(actual, p50, p90, alpha=0.5))
+        crps = aggregate_crps(crps_vals)
+        cov80_mean = aggregate_coverage(cov80)
+        cov90_mean = aggregate_coverage(cov90)
+        gap80 = coverage_gap(cov80_mean, 0.8)
+        out.append(PredictorScore(
+            predictor_version=pv, line=line, direction_code=direction,
+            n=len(items),
+            crps=crps,
+            pinball_q50=_mean(pin50),
+            pinball_q80=_mean(pin80),
+            pinball_q90=_mean(pin90),
+            coverage_p80=cov80_mean,
+            coverage_p90=cov90_mean,
+            coverage_gap_p80=gap80,
+            tail_miss_p90_rate=aggregate_coverage(tail_misses),
+            interval_score_p50_p90=_mean(intervals),
+            decision_loss=decision_score(crps, gap80),
+        ))
+    out.sort(key=lambda s: (s.line, s.direction_code, s.decision_loss))
+    return out
+
+
+def _mean(values: list[float]) -> float:
+    finite = [v for v in values if v == v]
+    return sum(finite) / len(finite) if finite else float("nan")
+
+
+def best_predictor_per_corridor(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    min_samples: int = 30,
+    since: datetime | None = None,
+) -> dict[str, list[PredictorScore]]:
+    """Group ``crps_per_predictor`` output by (line, direction) and sort
+    ascending by decision_loss. The first element of each list is the
+    current winner — feed this to ``registry.promote()`` to drive
+    automatic switching."""
+    scores = crps_per_predictor(conn, min_samples=min_samples, since=since)
+    grouped: dict[str, list[PredictorScore]] = {}
+    for s in scores:
+        key = f"{s.line}|{s.direction_code}"
+        grouped.setdefault(key, []).append(s)
+    for k in grouped:
+        grouped[k].sort(key=lambda s: s.decision_loss)
+    return grouped
 
 
 def status(conn: duckdb.DuckDBPyConnection) -> Status:

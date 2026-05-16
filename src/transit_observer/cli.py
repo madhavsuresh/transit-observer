@@ -17,6 +17,7 @@ from .metrics import (
     uncovered_buckets,
 )
 from .setup import write_config
+from .training.cli import predictors_group, train_group
 
 
 @click.group()
@@ -207,6 +208,8 @@ def api(host: str, port: int) -> None:
 
 def main() -> None:
     cli.add_command(status_cmd, name="status")
+    cli.add_command(train_group, name="train")
+    cli.add_command(predictors_group, name="predictors")
     cli(standalone_mode=True)
 
 
