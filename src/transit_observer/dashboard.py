@@ -13,10 +13,10 @@ import duckdb
 import pandas as pd
 import streamlit as st
 
-from . import db
-from .config import CHICAGO, settings
-from .direction_audit import audit_summary
-from .metrics import corridor_coverage, status
+from transit_observer import db
+from transit_observer.config import CHICAGO, settings
+from transit_observer.direction_audit import audit_summary
+from transit_observer.metrics import corridor_coverage, status
 
 
 st.set_page_config(page_title="transit-observer", layout="wide")
