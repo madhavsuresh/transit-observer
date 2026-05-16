@@ -38,6 +38,23 @@ CREATE TABLE IF NOT EXISTS train_arrivals_raw (
 CREATE INDEX IF NOT EXISTS idx_arrivals_polled ON train_arrivals_raw(polled_at);
 CREATE INDEX IF NOT EXISTS idx_arrivals_run_station ON train_arrivals_raw(run_number, line, map_id);
 
+CREATE TABLE IF NOT EXISTS train_positions_raw (
+    polled_at           TIMESTAMPTZ NOT NULL,
+    line                TEXT NOT NULL,
+    run_number          TEXT NOT NULL,
+    destination_name    TEXT,
+    direction_code      TEXT,
+    next_station_map_id INTEGER,
+    next_station_name   TEXT,
+    predicted_at        TIMESTAMPTZ,
+    next_arrival_at     TIMESTAMPTZ,
+    is_approaching      BOOLEAN,
+    is_delayed          BOOLEAN
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_polled ON train_positions_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_positions_run_next ON train_positions_raw(line, run_number, next_station_map_id);
+
 CREATE TABLE IF NOT EXISTS train_runs_observed (
     line                TEXT        NOT NULL,
     run_number          TEXT        NOT NULL,
@@ -80,6 +97,20 @@ CREATE TABLE IF NOT EXISTS forecast_queue (
 );
 
 CREATE INDEX IF NOT EXISTS idx_forecast_status_resolve ON forecast_queue(status, resolve_after);
+
+CREATE TABLE IF NOT EXISTS direction_audit (
+    forecast_id                       TEXT PRIMARY KEY,
+    audited_at                        TIMESTAMPTZ NOT NULL,
+    candidate_arrivals_count          INTEGER NOT NULL,
+    kept_arrivals_count               INTEGER NOT NULL,
+    kept_direction_codes              TEXT,
+    kept_destination_names            TEXT,
+    boarded_direction_code            TEXT,
+    boarded_destination_name          TEXT,
+    boarded_was_kept                  BOOLEAN,
+    kept_matching_boarded_direction   INTEGER,
+    notes                             TEXT
+);
 
 CREATE TABLE IF NOT EXISTS forecast_outcomes (
     forecast_id              TEXT PRIMARY KEY,

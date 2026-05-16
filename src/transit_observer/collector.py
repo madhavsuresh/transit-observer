@@ -49,6 +49,7 @@ async def run(stngs: Settings = settings) -> None:
     last_trip_gen = datetime.now(CHICAGO)
     last_resolver = datetime.now(CHICAGO)
     last_trajectory = datetime.now(CHICAGO)
+    last_positions_poll = datetime.now(CHICAGO)
     rng = random.Random()
 
     stop_event = asyncio.Event()
@@ -62,6 +63,12 @@ async def run(stngs: Settings = settings) -> None:
                 tick_started = datetime.now(CHICAGO)
                 batch = _take(rotation, stngs.station_round_robin_batch)
                 await _poll_and_persist(conn, client, batch=batch)
+
+                if (tick_started - last_positions_poll).total_seconds() >= stngs.poll_interval_seconds:
+                    n_positions = await _poll_positions(conn, client, lines=stngs.line_codes)
+                    if n_positions:
+                        log.info("positions.polled", n=n_positions)
+                    last_positions_poll = tick_started
 
                 if (tick_started - last_trajectory).total_seconds() >= stngs.poll_interval_seconds * 4:
                     written = trajectory.build_observed_runs(conn, now=tick_started)
@@ -136,6 +143,45 @@ async def _poll_and_persist(
         """,
         inserts,
     )
+
+
+async def _poll_positions(
+    conn: duckdb.DuckDBPyConnection,
+    client: CTATrainClient,
+    *,
+    lines: tuple[str, ...],
+) -> int:
+    """One ttpositions request covers all in-flight runs across the listed
+    lines. ~8 requests every 30s; way cheaper than per-station polling and
+    a more authoritative trajectory signal."""
+    try:
+        positions = await client.fetch_positions(line_codes=lines)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("positions.error", err=str(exc))
+        return 0
+    polled_at = datetime.now(CHICAGO)
+    if not positions:
+        return 0
+    rows = [
+        (
+            polled_at, p.line, p.run_number, p.destination_name, p.direction_code,
+            p.next_station_map_id, p.next_station_name,
+            p.predicted_at, p.next_arrival_at,
+            p.is_approaching, p.is_delayed,
+        )
+        for p in positions
+    ]
+    conn.executemany(
+        """
+        INSERT INTO train_positions_raw (
+            polled_at, line, run_number, destination_name, direction_code,
+            next_station_map_id, next_station_name,
+            predicted_at, next_arrival_at, is_approaching, is_delayed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
 
 
 def _generate_trips(

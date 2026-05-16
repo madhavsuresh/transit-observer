@@ -1,19 +1,19 @@
-"""Reconstruct observed train arrivals from raw prediction snapshots.
+"""Reconstruct observed train arrivals from raw prediction + position snapshots.
 
-CTA doesn't expose a clean "train arrived at station X at time T" signal.
-We approximate by tracking each (line, run_number, map_id) tuple through
-the prediction stream:
+Three signals in priority order:
 
-- The arrival is **observed** as `predicted_arrival_at` of the most-recent
-  prediction we saw with `is_approaching = true`, OR the most-recent
-  predicted_arrival_at before the prediction stopped appearing in the feed.
+1. **positions:isApp** — `ttpositions` reports `isApp=true` for run R at
+   `nextStaId = S`. The train is physically pulling in. Strongest signal.
+   We use the position poll's `polled_at` as the observed arrival — the
+   moment we directly saw the train at the station.
+2. **arrivals:approaching** — `ttarrivals` reports `isApp=true` for run R
+   at `staId = S`. Same semantics from per-station polling. We use the
+   prediction's `arrival_at`.
+3. **arrivals:dropoff** — the prediction's `arrival_at` has passed and
+   the run stopped appearing in the feed at that station. Weakest signal.
 
-This is heuristic. Real GTFS-RT vehicle positions would be more precise.
-We mark the source with `inferred_from = 'approaching' | 'dropoff'` so
-downstream metrics can weight by reliability.
-
-The builder is **incremental**: each call processes only raw arrivals
-newer than the latest `last_seen_at` already in `train_runs_observed`.
+`inferred_from` records which path was used. Downstream metrics can
+trust positions-derived rows more than dropoff-derived ones.
 """
 
 from __future__ import annotations
@@ -44,14 +44,11 @@ def build_observed_runs(
     horizon_hours: float = 6.0,
     now: datetime,
 ) -> int:
-    """Re-derive `train_runs_observed` rows for any (line, run, station)
-    tuples whose final-prediction window falls inside the horizon.
-
-    Returns the number of rows written.
-    """
+    """Re-derive `train_runs_observed` rows from arrivals + positions data
+    inside the horizon. Returns the number of rows written."""
     cutoff = now - timedelta(hours=horizon_hours)
 
-    rows = conn.execute(
+    arrival_rows = conn.execute(
         """
         SELECT line, run_number, map_id, polled_at, arrival_at, is_approaching, direction_code, destination_name
           FROM train_arrivals_raw
@@ -62,9 +59,21 @@ def build_observed_runs(
         [cutoff],
     ).fetchall()
 
-    grouped: dict[tuple[str, str, int], list[_RunSample]] = defaultdict(list)
-    for line, run, map_id, polled_at, arrival_at, is_app, dir_code, dest in rows:
-        grouped[(line, run, map_id)].append(
+    position_rows = conn.execute(
+        """
+        SELECT line, run_number, next_station_map_id, polled_at, next_arrival_at, is_approaching,
+               direction_code, destination_name
+          FROM train_positions_raw
+         WHERE polled_at >= ?
+           AND next_station_map_id IS NOT NULL
+         ORDER BY polled_at
+        """,
+        [cutoff],
+    ).fetchall()
+
+    arrivals_grouped: dict[tuple[str, str, int], list[_RunSample]] = defaultdict(list)
+    for line, run, map_id, polled_at, arrival_at, is_app, dir_code, dest in arrival_rows:
+        arrivals_grouped[(line, run, map_id)].append(
             _RunSample(
                 polled_at=polled_at,
                 predicted_arrival_at=arrival_at,
@@ -74,23 +83,37 @@ def build_observed_runs(
             )
         )
 
+    positions_grouped: dict[tuple[str, str, int], list[_PositionSample]] = defaultdict(list)
+    for line, run, next_map_id, polled_at, next_arr, is_app, dir_code, dest in position_rows:
+        if next_map_id is None:
+            continue
+        positions_grouped[(line, run, int(next_map_id))].append(
+            _PositionSample(
+                polled_at=polled_at,
+                predicted_arrival_at=next_arr,
+                is_approaching=bool(is_app),
+                direction_code=dir_code,
+                destination_name=dest,
+            )
+        )
+
+    keys = set(arrivals_grouped.keys()) | set(positions_grouped.keys())
     inserts: list[tuple] = []
-    for (line, run, map_id), samples in grouped.items():
-        observed = _resolve_observed(samples, now=now)
+    for key in keys:
+        line, run, map_id = key
+        observed = _resolve_observed(
+            arrival_samples=arrivals_grouped.get(key, []),
+            position_samples=positions_grouped.get(key, []),
+            now=now,
+        )
         if observed is None:
             continue
         inserts.append(
             (
-                line,
-                run,
-                map_id,
-                observed.direction_code,
-                observed.destination_name,
-                observed.observed_arrival_at,
-                observed.first_seen_at,
-                observed.last_seen_at,
-                observed.sample_count,
-                observed.inferred_from,
+                line, run, map_id,
+                observed.direction_code, observed.destination_name,
+                observed.observed_arrival_at, observed.first_seen_at, observed.last_seen_at,
+                observed.sample_count, observed.inferred_from,
             )
         )
 
@@ -111,6 +134,15 @@ def build_observed_runs(
 
 
 @dataclass(frozen=True)
+class _PositionSample:
+    polled_at: datetime
+    predicted_arrival_at: datetime | None
+    is_approaching: bool
+    direction_code: str | None
+    destination_name: str | None
+
+
+@dataclass(frozen=True)
 class _ObservedArrival:
     observed_arrival_at: datetime
     first_seen_at: datetime
@@ -121,47 +153,87 @@ class _ObservedArrival:
     destination_name: str | None
 
 
-def _resolve_observed(samples: Iterable[_RunSample], *, now: datetime) -> _ObservedArrival | None:
-    """Pick the best estimate of when the run arrived at the station.
+def _resolve_observed(
+    *,
+    arrival_samples: list[_RunSample],
+    position_samples: list[_PositionSample],
+    now: datetime,
+) -> _ObservedArrival | None:
+    """Pick the best estimate of when the run arrived at the station,
+    consulting both signal streams.
 
-    Rules in priority order:
-    1. The latest sample where `is_approaching` was true — the train was
-       reported as pulling in. Use its `predicted_arrival_at`.
-    2. Otherwise, if the latest sample's `predicted_arrival_at` is in the
-       past relative to `now`, the prediction "dropped off" the feed
-       implying the train passed. Use that predicted_arrival_at.
-    3. Otherwise, the train hasn't arrived yet — skip.
+    Priority order:
+    1. `positions:isApp` — train is physically pulling in per the position
+       feed. observed = `polled_at` of that sample.
+    2. `arrivals:approaching` — per-station feed reports the same.
+       observed = `predicted_arrival_at`.
+    3. `arrivals:dropoff` — prediction's `predicted_arrival_at` has passed
+       and the run stopped appearing in the feed.
     """
-    seq = sorted(samples, key=lambda s: s.polled_at)
-    if not seq:
-        return None
-    direction = next((s.direction_code for s in reversed(seq) if s.direction_code), None)
-    destination = next((s.destination_name for s in reversed(seq) if s.destination_name), None)
-    approaching = [s for s in seq if s.is_approaching]
-    if approaching:
-        latest = approaching[-1]
+    direction = (
+        _latest_non_null(reversed(position_samples), "direction_code")
+        or _latest_non_null(reversed(arrival_samples), "direction_code")
+    )
+    destination = (
+        _latest_non_null(reversed(position_samples), "destination_name")
+        or _latest_non_null(reversed(arrival_samples), "destination_name")
+    )
+
+    position_app = [p for p in position_samples if p.is_approaching]
+    if position_app:
+        latest = max(position_app, key=lambda s: s.polled_at)
         return _ObservedArrival(
-            observed_arrival_at=latest.predicted_arrival_at,
-            first_seen_at=seq[0].polled_at,
-            last_seen_at=seq[-1].polled_at,
-            sample_count=len(seq),
-            inferred_from="approaching",
+            observed_arrival_at=latest.polled_at,
+            first_seen_at=_min_polled(arrival_samples, position_samples),
+            last_seen_at=_max_polled(arrival_samples, position_samples),
+            sample_count=len(arrival_samples) + len(position_samples),
+            inferred_from="positions:approaching",
             direction_code=direction,
             destination_name=destination,
         )
 
-    latest = seq[-1]
-    # The prediction last said the train would arrive at this time; if that's
-    # already in the past, the run almost certainly already arrived.
-    if latest.predicted_arrival_at <= now:
+    arrival_app = [s for s in arrival_samples if s.is_approaching]
+    if arrival_app:
+        latest = max(arrival_app, key=lambda s: s.polled_at)
         return _ObservedArrival(
             observed_arrival_at=latest.predicted_arrival_at,
-            first_seen_at=seq[0].polled_at,
-            last_seen_at=seq[-1].polled_at,
-            sample_count=len(seq),
-            inferred_from="dropoff",
+            first_seen_at=_min_polled(arrival_samples, position_samples),
+            last_seen_at=_max_polled(arrival_samples, position_samples),
+            sample_count=len(arrival_samples) + len(position_samples),
+            inferred_from="arrivals:approaching",
             direction_code=direction,
             destination_name=destination,
         )
+
+    if arrival_samples:
+        latest = max(arrival_samples, key=lambda s: s.polled_at)
+        if latest.predicted_arrival_at <= now:
+            return _ObservedArrival(
+                observed_arrival_at=latest.predicted_arrival_at,
+                first_seen_at=_min_polled(arrival_samples, position_samples),
+                last_seen_at=_max_polled(arrival_samples, position_samples),
+                sample_count=len(arrival_samples) + len(position_samples),
+                inferred_from="arrivals:dropoff",
+                direction_code=direction,
+                destination_name=destination,
+            )
 
     return None
+
+
+def _latest_non_null(samples: Iterable, attr: str) -> str | None:
+    for s in samples:
+        value = getattr(s, attr)
+        if value:
+            return value
+    return None
+
+
+def _min_polled(arr: list, pos: list) -> datetime:
+    timestamps = [s.polled_at for s in arr] + [s.polled_at for s in pos]
+    return min(timestamps)
+
+
+def _max_polled(arr: list, pos: list) -> datetime:
+    timestamps = [s.polled_at for s in arr] + [s.polled_at for s in pos]
+    return max(timestamps)

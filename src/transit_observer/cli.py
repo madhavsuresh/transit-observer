@@ -5,6 +5,7 @@ from __future__ import annotations
 import click
 
 from . import db
+from .direction_audit import audit_summary
 from .metrics import calibration_bins, corridor_coverage, status, uncovered_buckets
 
 
@@ -60,6 +61,22 @@ def corridors(target: int) -> None:
         click.echo(f"{line:<8}{direction:<8}{hod:>4}  {str(weekday):>3}  {n:>4}")
     if len(rows) > 40:
         click.echo(f"... and {len(rows) - 40} more")
+
+
+@cli.command()
+@click.option("--min-samples", default=5, show_default=True, type=int)
+def audit(min_samples: int) -> None:
+    """Direction-filter audit. Recall = did the filter keep the boarded
+    train? Precision = of arrivals it kept, what fraction matched the
+    boarded direction code?"""
+    with db.reader() as conn:
+        rows = audit_summary(conn, min_samples=min_samples)
+    if not rows:
+        click.echo(f"no audited lines with ≥{min_samples} samples yet")
+        return
+    click.echo(f"{'line':<8}{'n':>5}  {'recall':>8}  {'precision':>10}")
+    for r in rows:
+        click.echo(f"{r.line:<8}{r.n_audited:>5}  {r.recall_rate:>7.1%}  {r.avg_direction_precision:>9.1%}")
 
 
 @cli.command()

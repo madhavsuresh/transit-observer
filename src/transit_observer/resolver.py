@@ -19,6 +19,8 @@ from typing import Iterable
 
 import duckdb
 
+from .direction_audit import audit_resolved_forecast
+
 log = logging.getLogger(__name__)
 
 
@@ -108,6 +110,10 @@ def resolve_due_forecasts(
             "UPDATE forecast_queue SET status = 'resolved' WHERE forecast_id = ?",
             [forecast.forecast_id],
         )
+        try:
+            audit_resolved_forecast(conn, forecast_id=forecast.forecast_id, now=now)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("direction_audit.error", forecast_id=forecast.forecast_id, err=str(exc))
         n_resolved += 1
 
     return n_resolved, n_unresolvable
