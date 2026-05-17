@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS train_arrivals_raw (
     is_approaching   BOOLEAN,
     is_delayed       BOOLEAN,
     is_fault         BOOLEAN,
-    is_scheduled     BOOLEAN
+    is_scheduled     BOOLEAN,
+    flags            TEXT,
+    stop_description TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_arrivals_polled ON train_arrivals_raw(polled_at);
@@ -50,7 +52,10 @@ CREATE TABLE IF NOT EXISTS train_positions_raw (
     predicted_at        TIMESTAMPTZ,
     next_arrival_at     TIMESTAMPTZ,
     is_approaching      BOOLEAN,
-    is_delayed          BOOLEAN
+    is_delayed          BOOLEAN,
+    lat                 DOUBLE,
+    lon                 DOUBLE,
+    heading             DOUBLE
 );
 
 CREATE INDEX IF NOT EXISTS idx_positions_polled ON train_positions_raw(polled_at);
@@ -213,6 +218,28 @@ CREATE TABLE IF NOT EXISTS bus_predictions_raw (
 CREATE INDEX IF NOT EXISTS idx_bus_polled ON bus_predictions_raw(polled_at);
 CREATE INDEX IF NOT EXISTS idx_bus_route_stop ON bus_predictions_raw(route, stop_id);
 
+CREATE TABLE IF NOT EXISTS bus_positions_raw (
+    polled_at         TIMESTAMPTZ NOT NULL,
+    route             TEXT NOT NULL,
+    vehicle_id        TEXT NOT NULL,
+    vehicle_timestamp TIMESTAMPTZ,
+    lat               DOUBLE,
+    lon               DOUBLE,
+    heading           DOUBLE,
+    speed_mph         DOUBLE,
+    pattern_id        INTEGER,
+    pattern_distance  DOUBLE,
+    trip_id           TEXT,
+    block_id          TEXT,
+    destination       TEXT,
+    is_delayed        BOOLEAN,
+    zone              TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_bus_positions_polled ON bus_positions_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_bus_positions_route_vehicle
+    ON bus_positions_raw(route, vehicle_id, polled_at);
+
 CREATE TABLE IF NOT EXISTS bus_runs_observed (
     route               TEXT NOT NULL,
     vehicle_id          TEXT NOT NULL,
@@ -346,6 +373,229 @@ CREATE TABLE IF NOT EXISTS model_artifacts (
     PRIMARY KEY (predictor_version, leg, line, quantile)
 );
 
+-- Local sports schedules (ESPN). One row per (team-poll, event). First
+-- snapshot to see ``completed=true`` approximates the game-end time.
+CREATE TABLE IF NOT EXISTS sports_events_raw (
+    snapshot_polled_at TIMESTAMPTZ NOT NULL,
+    event_id           TEXT NOT NULL,
+    league             TEXT NOT NULL,
+    sport              TEXT,
+    home_team          TEXT,
+    away_team          TEXT,
+    venue              TEXT,
+    scheduled_start    TIMESTAMPTZ,
+    status             TEXT,
+    completed          BOOLEAN,
+    attendance         INTEGER,
+    home_score         INTEGER,
+    away_score         INTEGER,
+    raw_payload_json   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sports_polled ON sports_events_raw(snapshot_polled_at);
+CREATE INDEX IF NOT EXISTS idx_sports_event
+    ON sports_events_raw(league, event_id, snapshot_polled_at);
+
+-- Venue events (Ticketmaster Discovery API). Concerts and major events
+-- at music + sports venues.
+CREATE TABLE IF NOT EXISTS venue_events_raw (
+    snapshot_polled_at TIMESTAMPTZ NOT NULL,
+    event_id           TEXT NOT NULL,
+    name               TEXT,
+    venue_name         TEXT,
+    venue_city         TEXT,
+    scheduled_start    TIMESTAMPTZ,
+    sales_start        TIMESTAMPTZ,
+    sales_end          TIMESTAMPTZ,
+    classification     TEXT,
+    genre              TEXT,
+    url                TEXT,
+    raw_payload_json   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_venue_polled ON venue_events_raw(snapshot_polled_at);
+CREATE INDEX IF NOT EXISTS idx_venue_event
+    ON venue_events_raw(event_id, snapshot_polled_at);
+
+-- Chicago Open Data snapshots. One row per record per poll.
+CREATE TABLE IF NOT EXISTS chicago_open_data_raw (
+    snapshot_polled_at TIMESTAMPTZ NOT NULL,
+    dataset            TEXT NOT NULL,    -- our local label, e.g. 'street_closures'
+    table_id           TEXT NOT NULL,    -- Socrata id, e.g. 'dhk3-bs2g'
+    record_id          TEXT,             -- Socrata `:id`
+    raw_payload_json   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chi_open_polled ON chicago_open_data_raw(snapshot_polled_at);
+CREATE INDEX IF NOT EXISTS idx_chi_open_dataset ON chicago_open_data_raw(dataset, snapshot_polled_at);
+
+-- Weather observations (Open-Meteo). One row per (site, poll).
+CREATE TABLE IF NOT EXISTS weather_observations_raw (
+    polled_at              TIMESTAMPTZ NOT NULL,
+    site_id                TEXT NOT NULL,
+    lat                    DOUBLE NOT NULL,
+    lon                    DOUBLE NOT NULL,
+    observation_time       TIMESTAMPTZ,
+    temperature_c          DOUBLE,
+    apparent_temperature_c DOUBLE,
+    humidity_pct           DOUBLE,
+    precipitation_mm       DOUBLE,
+    rain_mm                DOUBLE,
+    snowfall_cm            DOUBLE,
+    wind_speed_kph         DOUBLE,
+    wind_gust_kph          DOUBLE,
+    wind_direction_deg     DOUBLE,
+    cloud_cover_pct        DOUBLE,
+    pressure_hpa           DOUBLE,
+    weather_code           INTEGER,
+    source                 TEXT NOT NULL DEFAULT 'open_meteo'
+);
+
+CREATE INDEX IF NOT EXISTS idx_weather_polled ON weather_observations_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_weather_site ON weather_observations_raw(site_id, polled_at);
+
+-- Air-quality observations (AirNow). One row per (site, poll).
+CREATE TABLE IF NOT EXISTS air_quality_raw (
+    polled_at        TIMESTAMPTZ NOT NULL,
+    site_id          TEXT NOT NULL,        -- zip code or site name
+    parameter        TEXT NOT NULL,        -- 'pm2.5' | 'pm10' | 'ozone' | 'co' | 'no2' | 'so2'
+    aqi              INTEGER,
+    raw_value        DOUBLE,
+    unit             TEXT,
+    category         TEXT,                 -- 'Good' | 'Moderate' | ...
+    observation_time TIMESTAMPTZ,
+    reporting_area   TEXT,
+    latitude         DOUBLE,
+    longitude        DOUBLE,
+    source           TEXT NOT NULL DEFAULT 'airnow'
+);
+
+CREATE INDEX IF NOT EXISTS idx_aqi_polled ON air_quality_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_aqi_site ON air_quality_raw(site_id, polled_at);
+
+-- GTFS-static feed version archive. One row per unique content hash
+-- per agency. Zips are stored on disk under ``data/gtfs_snapshots/{agency}/``
+-- (out of the DB) since they can be multi-MB each.
+CREATE TABLE IF NOT EXISTS gtfs_feed_versions (
+    agency        TEXT NOT NULL,
+    sha256        TEXT NOT NULL,
+    downloaded_at TIMESTAMPTZ NOT NULL,
+    file_size     BIGINT,
+    feed_version  TEXT,           -- from feed_info.txt if present
+    source_url    TEXT,
+    archive_path  TEXT,
+    PRIMARY KEY (agency, sha256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gtfs_versions_agency
+    ON gtfs_feed_versions(agency, downloaded_at);
+
+-- CTA GTFS-Realtime TripUpdates (train + bus). Parallel to the
+-- proprietary ttarrivals/Bus Tracker feeds. Gives canonical trip_id
+-- (joinable to GTFS-static) plus per-stop delay. One row per
+-- stop_time_update.
+CREATE TABLE IF NOT EXISTS cta_gtfsrt_trip_updates_raw (
+    polled_at                TIMESTAMPTZ NOT NULL,
+    mode                     TEXT NOT NULL,    -- 'train' | 'bus'
+    route_id                 TEXT,
+    trip_id                  TEXT,
+    stop_id                  TEXT,
+    stop_sequence            INTEGER,
+    arrival_time             TIMESTAMPTZ,
+    arrival_delay_seconds    INTEGER,
+    departure_time           TIMESTAMPTZ,
+    departure_delay_seconds  INTEGER,
+    schedule_relationship    TEXT,
+    vehicle_id               TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cta_gtfsrt_tu_polled
+    ON cta_gtfsrt_trip_updates_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_cta_gtfsrt_tu_trip
+    ON cta_gtfsrt_trip_updates_raw(mode, route_id, trip_id);
+
+-- CTA GTFS-Realtime VehiclePositions. Parallel to ttpositions for trains
+-- but with trip_id binding + occupancy/congestion fields where published.
+CREATE TABLE IF NOT EXISTS cta_gtfsrt_vehicle_positions_raw (
+    polled_at             TIMESTAMPTZ NOT NULL,
+    mode                  TEXT NOT NULL,    -- 'train' | 'bus'
+    route_id              TEXT,
+    trip_id               TEXT,
+    vehicle_id            TEXT,
+    vehicle_label         TEXT,
+    lat                   DOUBLE,
+    lon                   DOUBLE,
+    bearing               DOUBLE,
+    speed_mps             DOUBLE,
+    current_stop_sequence INTEGER,
+    current_status        TEXT,
+    congestion_level      TEXT,
+    occupancy_status      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cta_gtfsrt_vp_polled
+    ON cta_gtfsrt_vehicle_positions_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_cta_gtfsrt_vp_vehicle
+    ON cta_gtfsrt_vehicle_positions_raw(mode, vehicle_id, polled_at);
+
+-- Transit-account social media posts (Bluesky, Mastodon). Captured
+-- forward-only — historical timeline search is paywalled / unreliable.
+CREATE TABLE IF NOT EXISTS transit_social_raw (
+    polled_at        TIMESTAMPTZ NOT NULL,
+    platform         TEXT NOT NULL,    -- 'bluesky' | 'mastodon'
+    handle           TEXT NOT NULL,
+    post_id          TEXT NOT NULL,
+    posted_at        TIMESTAMPTZ,
+    body             TEXT,
+    url              TEXT,
+    in_reply_to      TEXT,
+    media_urls_json  TEXT,
+    raw_payload_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_social_polled ON transit_social_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_social_post ON transit_social_raw(platform, handle, post_id);
+
+-- CTA service alerts. Snapshotted on every poll (no de-duplication) so
+-- we can reconstruct the active alert set at any historical timestamp.
+-- The live feed has no public archive.
+CREATE TABLE IF NOT EXISTS cta_alerts_raw (
+    polled_at              TIMESTAMPTZ NOT NULL,
+    alert_id               TEXT NOT NULL,
+    headline               TEXT,
+    short_description      TEXT,
+    full_description       TEXT,
+    severity_score         INTEGER,
+    impact                 TEXT,
+    event_start            TIMESTAMPTZ,
+    event_end              TIMESTAMPTZ,
+    tbd                    BOOLEAN,
+    major_alert            BOOLEAN,
+    alert_url              TEXT,
+    impacted_services_json TEXT,
+    guid                   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cta_alerts_polled ON cta_alerts_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_cta_alerts_id ON cta_alerts_raw(alert_id, polled_at);
+
+-- One row per HTTP call to any external API. Stores the raw response body
+-- so future feature extraction can re-parse fields we currently drop,
+-- without needing to re-poll (impossible for time-of-day signal).
+-- API keys are scrubbed from request_params_json before storage.
+CREATE TABLE IF NOT EXISTS api_payloads_raw (
+    polled_at           TIMESTAMPTZ NOT NULL,
+    source              TEXT NOT NULL,        -- e.g. 'cta_train_arrivals', 'cta_bus_predictions', 'weather_open_meteo'
+    endpoint            TEXT NOT NULL,        -- URL path
+    request_params_json TEXT,
+    response_body       TEXT,
+    http_status         INTEGER,
+    latency_ms          DOUBLE
+);
+
+CREATE INDEX IF NOT EXISTS idx_payloads_polled ON api_payloads_raw(polled_at);
+CREATE INDEX IF NOT EXISTS idx_payloads_source ON api_payloads_raw(source, polled_at);
+
 CREATE INDEX IF NOT EXISTS idx_predictor_state_v
     ON predictor_state(predictor_version, line, direction_code);
 CREATE INDEX IF NOT EXISTS idx_arrivals_run_polled
@@ -410,6 +660,13 @@ _MIGRATIONS: tuple[tuple[str, str, str, str | None], ...] = (
     ("forecast_outcomes", "truth_confidence", "DOUBLE", None),
     ("corridors", "source",                  "TEXT",    "'seed'"),
     ("corridors", "promoted_from_query_count", "INTEGER", None),
+    # Tier 0a: stop discarding train vehicle position lat/lon/heading.
+    ("train_positions_raw", "lat",          "DOUBLE",  None),
+    ("train_positions_raw", "lon",          "DOUBLE",  None),
+    ("train_positions_raw", "heading",      "DOUBLE",  None),
+    # Tier 0b: capture incident flags + stop description on arrival predictions.
+    ("train_arrivals_raw", "flags",            "TEXT", None),
+    ("train_arrivals_raw", "stop_description", "TEXT", None),
 )
 
 

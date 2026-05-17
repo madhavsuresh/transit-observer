@@ -21,9 +21,11 @@ def isolated_paths(tmp_path: Path, monkeypatch):
     """Point DB + queries.ndjson at temp paths so tests can't clobber prod."""
     new_settings = Settings(
         cta_train_api_key=None, cta_bus_api_key=None, metra_api_key=None,
+        airnow_api_key=None, ticketmaster_api_key=None,
         data_dir=tmp_path, logs_dir=tmp_path,
         db_path=tmp_path / "test.duckdb",
         read_replica_path=tmp_path / "test.duckdb",
+        gtfs_archive_dir=tmp_path / "gtfs_snapshots",
     )
     monkeypatch.setattr("transit_observer.db.settings", new_settings)
     monkeypatch.setattr("transit_observer.config.settings", new_settings)

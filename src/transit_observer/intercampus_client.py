@@ -34,8 +34,19 @@ class IntercampusStopUpdate:
 
 
 class IntercampusClient:
-    def __init__(self, *, http: httpx.AsyncClient | None = None) -> None:
-        self._http = http or httpx.AsyncClient(timeout=15.0)
+    def __init__(
+        self,
+        *,
+        http: httpx.AsyncClient | None = None,
+        payload_recorder=None,
+    ) -> None:
+        if http is not None:
+            self._http = http
+        else:
+            event_hooks: dict = {}
+            if payload_recorder is not None:
+                event_hooks["response"] = [payload_recorder]
+            self._http = httpx.AsyncClient(timeout=15.0, event_hooks=event_hooks or None)
 
     async def aclose(self) -> None:
         await self._http.aclose()

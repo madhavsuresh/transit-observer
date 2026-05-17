@@ -41,6 +41,8 @@ class ArrivalRaw:
     is_delayed: bool
     is_fault: bool
     is_scheduled: bool
+    flags: str | None              # bitmap/string from CTA, semantics undocumented but worth keeping
+    stop_description: str | None   # e.g. "Service toward 95th" — more reliable than parsing direction_code
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,9 @@ class VehiclePositionRaw:
     next_arrival_at: datetime | None
     is_approaching: bool
     is_delayed: bool
+    lat: float | None
+    lon: float | None
+    heading: float | None
 
 
 def _parse_local_dt(value: str | None) -> datetime | None:
@@ -75,11 +80,23 @@ def _bool_one(flag: str | None) -> bool:
 class CTATrainClient:
     """Thin async client. Doesn't enforce rate limits — collector does."""
 
-    def __init__(self, api_key: str, *, http: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        http: httpx.AsyncClient | None = None,
+        payload_recorder=None,
+    ) -> None:
         if not api_key:
             raise ValueError("CTA_TRAIN_API_KEY is required")
         self._key = api_key
-        self._http = http or httpx.AsyncClient(timeout=10.0)
+        if http is not None:
+            self._http = http
+        else:
+            event_hooks: dict = {}
+            if payload_recorder is not None:
+                event_hooks["response"] = [payload_recorder]
+            self._http = httpx.AsyncClient(timeout=10.0, event_hooks=event_hooks or None)
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -136,6 +153,7 @@ def _arrival_from_eta(raw: dict) -> ArrivalRaw | None:
     arrival_at = _parse_local_dt(raw.get("arrT"))
     if predicted_at is None or arrival_at is None:
         return None
+    flags_raw = raw.get("flags")
     return ArrivalRaw(
         line=str(raw.get("rt", "")).strip(),
         run_number=str(raw.get("rn", "")).strip(),
@@ -150,6 +168,8 @@ def _arrival_from_eta(raw: dict) -> ArrivalRaw | None:
         is_delayed=_bool_one(raw.get("isDly")),
         is_fault=_bool_one(raw.get("isFlt")),
         is_scheduled=_bool_one(raw.get("isSch")),
+        flags=str(flags_raw) if flags_raw not in (None, "") else None,
+        stop_description=raw.get("stpDe") or None,
     )
 
 
@@ -171,4 +191,16 @@ def _position_from_train(*, line: str, raw: dict) -> VehiclePositionRaw | None:
         next_arrival_at=_parse_local_dt(raw.get("arrT")),
         is_approaching=_bool_one(raw.get("isApp")),
         is_delayed=_bool_one(raw.get("isDly")),
+        lat=_parse_float(raw.get("lat")),
+        lon=_parse_float(raw.get("lon")),
+        heading=_parse_float(raw.get("heading")),
     )
+
+
+def _parse_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None

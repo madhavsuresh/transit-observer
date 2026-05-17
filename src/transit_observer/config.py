@@ -24,16 +24,31 @@ class Settings:
     cta_train_api_key: str | None
     cta_bus_api_key: str | None
     metra_api_key: str | None
+    airnow_api_key: str | None
+    ticketmaster_api_key: str | None
     data_dir: Path
     logs_dir: Path
     db_path: Path
     read_replica_path: Path
+    gtfs_archive_dir: Path
 
     poll_interval_seconds: float = 30.0
     station_round_robin_batch: int = 18  # ~18 L stations per 30s = 36/min < 100/5min
     bus_round_robin_batch: int = 6        # 12/min — gentle on the 10,000/day bus budget
     metra_poll_interval_seconds: float = 60.0
     intercampus_poll_interval_seconds: float = 60.0
+    cta_alerts_poll_interval_seconds: float = 120.0       # service alerts feed; modest cadence is plenty
+    cta_gtfsrt_poll_interval_seconds: float = 60.0        # CTA GTFS-RT TripUpdates + VehiclePositions
+    bus_avl_poll_interval_seconds: float = 60.0           # getvehicles for monitored routes
+    weather_poll_interval_seconds: float = 900.0          # 15 min × a few sites
+    air_quality_poll_interval_seconds: float = 3600.0     # hourly
+    social_poll_interval_seconds: float = 600.0           # 10 min, polite to Mastodon/Bluesky
+    slow_zone_poll_interval_seconds: float = 86400.0      # daily snapshot
+    gtfs_static_poll_interval_seconds: float = 604800.0   # weekly check
+    sports_poll_interval_seconds: float = 300.0           # 5 min during in-progress games
+    venue_calendar_poll_interval_seconds: float = 604800.0  # weekly forward-looking
+    chicago_open_data_poll_interval_seconds: float = 86400.0  # daily snapshot
+    academic_calendar_poll_interval_seconds: float = 2592000.0  # ~monthly
     trip_generation_interval_seconds: float = 60.0
     trips_per_generation_tick: int = 3
     resolver_interval_seconds: float = 30.0
@@ -57,6 +72,80 @@ class Settings:
 
     line_codes: tuple[str, ...] = field(
         default_factory=lambda: ("red", "blue", "brn", "g", "org", "p", "pink", "y")
+    )
+    # Social accounts to mirror into transit_social_raw.
+    # Each tuple: (platform, identifier). Platform is 'bluesky' or 'mastodon'.
+    # Identifier is the Bluesky handle (e.g. 'cta.bsky.social') or
+    # 'user@instance' for Mastodon. Empty default = no-op poll.
+    monitored_social_accounts: tuple[tuple[str, str], ...] = field(
+        default_factory=tuple
+    )
+    # Weather sites to snapshot. (label, lat, lon). Open-Meteo, no key needed.
+    weather_sites: tuple[tuple[str, float, float], ...] = field(
+        default_factory=lambda: (
+            ("ord",      41.9786, -87.9048),
+            ("mdw",      41.7868, -87.7522),
+            ("downtown", 41.8781, -87.6298),
+        )
+    )
+    # AirNow AQI: zip codes to poll. Empty if no AIRNOW_API_KEY configured.
+    air_quality_zips: tuple[str, ...] = field(
+        default_factory=lambda: ("60601", "60616", "60642", "60653", "60660")
+    )
+    # ESPN sports teams to track (home games drive transit demand).
+    # Each tuple: (league, team_abbreviation). League in 'mlb' | 'nba' | 'nhl' | 'nfl' | 'wnba' | 'mls'.
+    sports_teams: tuple[tuple[str, str], ...] = field(
+        default_factory=lambda: (
+            ("mlb",  "chc"),    # Cubs (Wrigley)
+            ("mlb",  "chw"),    # White Sox (Rate)
+            ("nba",  "chi"),    # Bulls (United Center)
+            ("nhl",  "chi"),    # Blackhawks (United Center)
+            ("nfl",  "chi"),    # Bears (Soldier Field)
+            ("wnba", "chi"),    # Sky (Wintrust)
+            ("mls",  "chi"),    # Fire (Soldier Field)
+        )
+    )
+    # Chicago Open Data datasets to snapshot.
+    # Each tuple: (table_id, label). data.cityofchicago.org Socrata IDs.
+    chicago_open_datasets: tuple[tuple[str, str], ...] = field(
+        default_factory=lambda: (
+            ("dhk3-bs2g", "street_closures"),  # Street Closures Due to Construction
+            ("hidd-ufa7", "transportation_grants"),  # placeholder; expand as needed
+        )
+    )
+    # McCormick Place + other convention/venue calendar URLs to HTML-snapshot.
+    mccormick_urls: tuple[str, ...] = field(
+        default_factory=lambda: (
+            "https://www.mccormickplace.com/events/event-calendar/",
+        )
+    )
+    # Academic-calendar ICS / HTML URLs (CPS + Chicago-area universities).
+    # ICS where available is best; some require HTML scraping.
+    academic_calendar_urls: tuple[str, ...] = field(
+        default_factory=lambda: (
+            # Placeholders — operator should refine. Public ICS feeds vary
+            # year to year so we capture forward and leave parsing to later.
+            "https://www.cps.edu/calendar/",
+            "https://registrar.northwestern.edu/calendars/calendar-overview.html",
+            "https://college.uchicago.edu/academics/academic-calendar",
+            "https://catalog.depaul.edu/calendar/",
+            "https://www.luc.edu/academics/schedules/",
+            "https://catalog.uic.edu/ucat/academic-calendar/",
+        )
+    )
+    # GTFS-static archives to track. (agency, url).
+    gtfs_static_feeds: tuple[tuple[str, str], ...] = field(
+        default_factory=lambda: (
+            ("cta",   "https://www.transitchicago.com/downloads/sch_data/google_transit.zip"),
+            ("metra", "https://schedules.metrarail.com/gtfs/schedule.zip"),
+            ("pace",  "https://www.pacebus.com/sites/default/files/2024-09/GTFS.zip"),
+        )
+    )
+    # CTA GTFS-RT feeds. (mode, kind, url) — empty by default; operator
+    # fills in once feed URLs are confirmed (URLs have shifted historically).
+    # kind ∈ {'trip_updates', 'vehicle_positions'}; mode ∈ {'train', 'bus'}.
+    cta_gtfsrt_feeds: tuple[tuple[str, str, str], ...] = field(
+        default_factory=tuple
     )
     monitored_bus_stops: tuple[tuple[str, int], ...] = field(
         default_factory=lambda: (
@@ -127,8 +216,10 @@ def load() -> Settings:
     """Read config + env defaults. Env vars override the TOML file."""
     data = ROOT / "data"
     logs = ROOT / "logs"
+    gtfs_archive = data / "gtfs_snapshots"
     data.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
+    gtfs_archive.mkdir(parents=True, exist_ok=True)
 
     file_config = _read_config_file()
     api_keys = file_config.get("api_keys", {}) if isinstance(file_config, dict) else {}
@@ -137,10 +228,13 @@ def load() -> Settings:
         cta_train_api_key=_resolve("CTA_TRAIN_API_KEY", api_keys, "cta_train"),
         cta_bus_api_key=_resolve("CTA_BUS_API_KEY", api_keys, "cta_bus"),
         metra_api_key=_resolve("METRA_API_KEY", api_keys, "metra"),
+        airnow_api_key=_resolve("AIRNOW_API_KEY", api_keys, "airnow"),
+        ticketmaster_api_key=_resolve("TICKETMASTER_API_KEY", api_keys, "ticketmaster"),
         data_dir=data,
         logs_dir=logs,
         db_path=data / "transit_observer.duckdb",
         read_replica_path=data / "transit_observer_readonly.duckdb",
+        gtfs_archive_dir=gtfs_archive,
     )
 
 
