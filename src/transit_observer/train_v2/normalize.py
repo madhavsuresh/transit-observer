@@ -311,20 +311,30 @@ def normalize_gtfsrt_trip_updates(
 ) -> int:
     """Normalize GTFS-RT TripUpdates into train_v2_gtfsrt_trip_update.
 
-    Accepts ``cta_gtfsrt_client.CTAGtfsRtTripUpdate`` dataclasses (which
-    have ``arrival_time`` as a tz-aware ``datetime``). Returns row count.
+    Accepts ``cta_gtfsrt_client.CTAGtfsRtTripUpdate`` dataclasses. As of
+    tier-1 widening, every documented proto field is captured: feed
+    timestamp / incrementality, TripUpdate-level timestamp + delay,
+    TripDescriptor start_date/start_time/direction_id/schedule_relationship,
+    stop-time arrival/departure uncertainty, vehicle label + license plate.
     """
     n = 0
     for r in rows:
         arrival_ms = _dt_to_ms(getattr(r, "arrival_time", None))
         departure_ms = _dt_to_ms(getattr(r, "departure_time", None))
+        feed_ts_ms = _dt_to_ms(getattr(r, "feed_timestamp", None))
+        tu_ts_ms = _dt_to_ms(getattr(r, "trip_update_timestamp", None))
         conn.execute(
             """
             INSERT INTO train_v2_gtfsrt_trip_update(
                 poll_id, run_id, local_response_end_ms, route_id, trip_id, vehicle_id,
                 stop_id, stop_sequence, arrival_time_ms, arrival_delay_seconds,
-                departure_time_ms, departure_delay_seconds, schedule_relationship
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                departure_time_ms, departure_delay_seconds, schedule_relationship,
+                feed_timestamp_ms, feed_incrementality,
+                trip_update_timestamp_ms, trip_update_delay_seconds,
+                trip_start_date, trip_start_time, trip_direction_id, trip_schedule_relationship,
+                arrival_uncertainty_seconds, departure_uncertainty_seconds,
+                vehicle_label, vehicle_license_plate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 poll_id, run_id, local_response_end_ms,
@@ -334,6 +344,16 @@ def normalize_gtfsrt_trip_updates(
                 arrival_ms, getattr(r, "arrival_delay_seconds", None),
                 departure_ms, getattr(r, "departure_delay_seconds", None),
                 getattr(r, "schedule_relationship", None),
+                feed_ts_ms, getattr(r, "feed_incrementality", None),
+                tu_ts_ms, getattr(r, "trip_update_delay_seconds", None),
+                getattr(r, "trip_start_date", None),
+                getattr(r, "trip_start_time", None),
+                getattr(r, "trip_direction_id", None),
+                getattr(r, "trip_schedule_relationship", None),
+                getattr(r, "arrival_uncertainty_seconds", None),
+                getattr(r, "departure_uncertainty_seconds", None),
+                getattr(r, "vehicle_label", None),
+                getattr(r, "vehicle_license_plate", None),
             ],
         )
         n += 1
@@ -348,16 +368,29 @@ def normalize_gtfsrt_vehicle_positions(
     *,
     local_response_end_ms: int,
 ) -> int:
-    """Normalize GTFS-RT VehiclePositions into train_v2_gtfsrt_vehicle_position."""
+    """Normalize GTFS-RT VehiclePositions into train_v2_gtfsrt_vehicle_position.
+
+    Captures every documented proto field: feed timestamp / incrementality,
+    vehicle's own report timestamp, stop_id (which stop the vehicle is at),
+    occupancy_percentage, multi_carriage_details, TripDescriptor extras,
+    license_plate, and Position.odometer.
+    """
     n = 0
     for r in rows:
+        feed_ts_ms = _dt_to_ms(getattr(r, "feed_timestamp", None))
+        vehicle_ts_ms = _dt_to_ms(getattr(r, "vehicle_timestamp", None))
         conn.execute(
             """
             INSERT INTO train_v2_gtfsrt_vehicle_position(
                 poll_id, run_id, local_response_end_ms, route_id, trip_id, vehicle_id,
                 vehicle_label, lat, lon, bearing, speed_mps, current_stop_sequence,
-                current_status, congestion_level, occupancy_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                current_status, congestion_level, occupancy_status,
+                feed_timestamp_ms, feed_incrementality,
+                vehicle_timestamp_ms, stop_id, occupancy_percentage,
+                multi_carriage_details_json,
+                trip_start_date, trip_start_time, trip_direction_id, trip_schedule_relationship,
+                vehicle_license_plate, odometer_m
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 poll_id, run_id, local_response_end_ms,
@@ -368,6 +401,60 @@ def normalize_gtfsrt_vehicle_positions(
                 getattr(r, "current_stop_sequence", None),
                 getattr(r, "current_status", None), getattr(r, "congestion_level", None),
                 getattr(r, "occupancy_status", None),
+                feed_ts_ms, getattr(r, "feed_incrementality", None),
+                vehicle_ts_ms, getattr(r, "stop_id", None),
+                getattr(r, "occupancy_percentage", None),
+                getattr(r, "multi_carriage_details_json", None),
+                getattr(r, "trip_start_date", None),
+                getattr(r, "trip_start_time", None),
+                getattr(r, "trip_direction_id", None),
+                getattr(r, "trip_schedule_relationship", None),
+                getattr(r, "vehicle_license_plate", None),
+                getattr(r, "odometer_m", None),
+            ],
+        )
+        n += 1
+    return n
+
+
+def normalize_gtfsrt_alerts(
+    conn: duckdb.DuckDBPyConnection,
+    poll_id: int,
+    run_id: str,
+    rows: list[Any],
+    *,
+    local_response_end_ms: int,
+) -> int:
+    """Normalize GTFS-RT Alerts into train_v2_gtfsrt_alert.
+
+    Accepts ``cta_gtfsrt_client.CTAGtfsRtAlert`` dataclasses. Each row
+    has cause/effect/severity codes plus headline + description plus
+    a list of impacted entity selectors (route/trip/stop) and active
+    time ranges, stored as JSON for forward-compatibility.
+    """
+    n = 0
+    for r in rows:
+        feed_ts_ms = _dt_to_ms(getattr(r, "feed_timestamp", None))
+        conn.execute(
+            """
+            INSERT INTO train_v2_gtfsrt_alert(
+                poll_id, run_id, local_response_end_ms, feed_timestamp_ms, feed_incrementality,
+                entity_id, cause, effect, severity_level,
+                header_text, description_text, tts_header_text, tts_description_text, url,
+                active_period_json, informed_entity_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                poll_id, run_id, local_response_end_ms,
+                feed_ts_ms, getattr(r, "feed_incrementality", None),
+                getattr(r, "entity_id", None),
+                getattr(r, "cause", None), getattr(r, "effect", None),
+                getattr(r, "severity_level", None),
+                getattr(r, "header_text", None), getattr(r, "description_text", None),
+                getattr(r, "tts_header_text", None), getattr(r, "tts_description_text", None),
+                getattr(r, "url", None),
+                getattr(r, "active_period_json", None),
+                getattr(r, "informed_entity_json", None),
             ],
         )
         n += 1

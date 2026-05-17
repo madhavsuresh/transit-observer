@@ -40,6 +40,7 @@ from .train_v2.client import CTATrainV2Client
 from .train_v2.inference import infer_train_arrivals
 from .train_v2.normalize import (
     insert_api_poll as _train_v2_insert_api_poll,
+    normalize_gtfsrt_alerts,
     normalize_gtfsrt_trip_updates,
     normalize_gtfsrt_vehicle_positions,
 )
@@ -307,7 +308,7 @@ async def run(stngs: Settings = settings) -> None:
                     and stngs.cta_gtfsrt_feeds
                     and (tick_started - last_train_v2_gtfsrt_poll).total_seconds() >= stngs.train_v2_gtfsrt_interval_seconds
                 ):
-                    n_tu, n_vp = await _run_train_v2_gtfsrt(
+                    n_tu, n_vp, n_al = await _run_train_v2_gtfsrt(
                         conn,
                         cta_gtfsrt_client,
                         feeds=stngs.cta_gtfsrt_feeds,
@@ -315,8 +316,11 @@ async def run(stngs: Settings = settings) -> None:
                         cycle_index=train_v2_state.cycle_index,
                     )
                     last_train_v2_gtfsrt_poll = tick_started
-                    if n_tu or n_vp:
-                        log.info("train_v2.gtfsrt_polled", trip_updates=n_tu, vehicle_positions=n_vp)
+                    if n_tu or n_vp or n_al:
+                        log.info(
+                            "train_v2.gtfsrt_polled",
+                            trip_updates=n_tu, vehicle_positions=n_vp, alerts=n_al,
+                        )
 
                 if metra_client and (tick_started - last_metra_poll).total_seconds() >= stngs.metra_poll_interval_seconds:
                     n_metra = await _poll_metra(conn, metra_client)
@@ -760,6 +764,7 @@ async def _run_train_v2_gtfsrt(
     """
     n_tu = 0
     n_vp = 0
+    n_al = 0
     for mode, kind, url in feeds:
         if mode != "train":
             continue
@@ -769,6 +774,8 @@ async def _run_train_v2_gtfsrt(
                 rows = await client.fetch_trip_updates(url=url, mode="train")
             elif kind == "vehicle_positions":
                 rows = await client.fetch_vehicle_positions(url=url, mode="train")
+            elif kind == "alerts":
+                rows = await client.fetch_alerts(url=url, mode="train")
             else:
                 continue
             ok = True
@@ -804,7 +811,11 @@ async def _run_train_v2_gtfsrt(
             n_vp += normalize_gtfsrt_vehicle_positions(
                 conn, poll_id, run_id, rows, local_response_end_ms=end,
             )
-    return n_tu, n_vp
+        elif kind == "alerts":
+            n_al += normalize_gtfsrt_alerts(
+                conn, poll_id, run_id, rows, local_response_end_ms=end,
+            )
+    return n_tu, n_vp, n_al
 
 
 async def _poll_metra(

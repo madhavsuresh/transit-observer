@@ -8,6 +8,11 @@ and once an agency replaces a feed, the prior version is gone — so
 even a single live snapshot has long-term value.
 
 The poll cadence is weekly; the operator can re-run on demand.
+
+Tier-1 widening: each newly archived zip is now also extracted into
+the ``gtfs_static_*`` tables (stops/routes/trips/stop_times/shapes/
+calendar). Set ``extract=False`` to keep the archive but skip the
+extraction.
 """
 
 from __future__ import annotations
@@ -20,8 +25,13 @@ from pathlib import Path
 
 import duckdb
 import httpx
+import structlog
 
 from .config import CHICAGO
+from .gtfs_static_extract import extract_gtfs_archive
+
+
+log = structlog.get_logger(__name__)
 
 
 async def snapshot_gtfs_feeds(
@@ -29,8 +39,14 @@ async def snapshot_gtfs_feeds(
     *,
     feeds: tuple[tuple[str, str], ...],
     archive_dir: Path,
+    extract: bool = True,
 ) -> int:
     """Download each (agency, url). Save only if the content hash is new.
+
+    If ``extract=True`` (default) the new zip is also parsed into the
+    ``gtfs_static_*`` tables on success. Extraction failures are logged
+    but never abort the archive — we always want the bytes on disk so
+    we can re-extract later.
 
     Returns the number of *new* versions archived.
     """
@@ -62,6 +78,7 @@ async def snapshot_gtfs_feeds(
             except OSError:
                 continue
             feed_version = _read_feed_version(blob)
+            fetched_at = datetime.now(CHICAGO)
             conn.execute(
                 """
                 INSERT INTO gtfs_feed_versions (
@@ -72,7 +89,7 @@ async def snapshot_gtfs_feeds(
                 [
                     agency,
                     sha256,
-                    datetime.now(CHICAGO),
+                    fetched_at,
                     len(blob),
                     feed_version,
                     url,
@@ -80,6 +97,19 @@ async def snapshot_gtfs_feeds(
                 ],
             )
             n_new += 1
+            if extract:
+                try:
+                    extract_gtfs_archive(
+                        conn,
+                        agency=agency,
+                        archive_path=target,
+                        fetched_at_ms=int(fetched_at.timestamp() * 1000),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "gtfs_static.extract_failed",
+                        agency=agency, archive=str(target), err=str(exc),
+                    )
     return n_new
 
 
