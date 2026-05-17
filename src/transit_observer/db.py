@@ -1240,6 +1240,187 @@ CREATE INDEX IF NOT EXISTS idx_train_v2_online_estimate_lookup
     ON train_v2_online_estimate(map_id, line, generated_at_ms);
 CREATE INDEX IF NOT EXISTS idx_train_v2_residual_quantile_lookup
     ON train_v2_residual_quantile(line, map_id, direction_code, horizon_bin, quality_bin, created_at_ms);
+
+-- ============================================================
+-- GTFS-RT Alert entity. The proprietary CTA alerts RSS feed already
+-- lands in cta_alerts_raw. This table captures the GTFS-RT side, which
+-- carries machine-readable cause/effect/severity codes and a list of
+-- informed_entity selectors (route/trip/stop) that the RSS does not.
+-- ============================================================
+CREATE SEQUENCE IF NOT EXISTS train_v2_gtfsrt_alert_seq;
+CREATE TABLE IF NOT EXISTS train_v2_gtfsrt_alert (
+    alert_id                BIGINT PRIMARY KEY DEFAULT nextval('train_v2_gtfsrt_alert_seq'),
+    poll_id                 BIGINT NOT NULL,
+    run_id                  TEXT NOT NULL,
+    local_response_end_ms   BIGINT NOT NULL,
+    feed_timestamp_ms       BIGINT,
+    feed_incrementality     TEXT,
+    entity_id               TEXT,
+    cause                   TEXT,
+    effect                  TEXT,
+    severity_level          TEXT,
+    header_text             TEXT,
+    description_text        TEXT,
+    tts_header_text         TEXT,
+    tts_description_text    TEXT,
+    url                     TEXT,
+    active_period_json      TEXT,
+    informed_entity_json    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_train_v2_gtfsrt_alert_time
+    ON train_v2_gtfsrt_alert(local_response_end_ms);
+
+-- ============================================================
+-- GTFS-static extraction. We snapshot agency zips weekly via
+-- gtfs_static_archive but never project them into tables. These rows
+-- give us the canonical schedule (stop_times), official stop coords
+-- (stops), line geometry (shapes), and service calendars — joinable
+-- by trip_id and stop_id to GTFS-RT and (via id-bridge tables) to
+-- the proprietary feeds. One snapshot row per (agency, fetched_at);
+-- all extracted rows carry the snapshot_id FK.
+-- ============================================================
+CREATE SEQUENCE IF NOT EXISTS gtfs_static_snapshot_seq;
+CREATE TABLE IF NOT EXISTS gtfs_static_snapshot (
+    snapshot_id             BIGINT PRIMARY KEY DEFAULT nextval('gtfs_static_snapshot_seq'),
+    agency                  TEXT NOT NULL,
+    archive_path            TEXT NOT NULL,
+    fetched_at_ms           BIGINT NOT NULL,
+    extracted_at_ms         BIGINT,
+    archive_sha256          TEXT,
+    feed_start_date         TEXT,
+    feed_end_date           TEXT,
+    feed_publisher_name     TEXT,
+    feed_version            TEXT,
+    n_stops                 INTEGER,
+    n_routes                INTEGER,
+    n_trips                 INTEGER,
+    n_stop_times            BIGINT,
+    n_shapes                BIGINT,
+    n_calendar              INTEGER,
+    n_calendar_dates        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS gtfs_static_agency (
+    snapshot_id             BIGINT NOT NULL,
+    agency_id               TEXT NOT NULL,
+    agency_name             TEXT,
+    agency_url              TEXT,
+    agency_timezone         TEXT,
+    agency_lang             TEXT,
+    agency_phone            TEXT,
+    agency_fare_url         TEXT,
+    agency_email            TEXT,
+    PRIMARY KEY (snapshot_id, agency_id)
+);
+
+CREATE TABLE IF NOT EXISTS gtfs_static_stops (
+    snapshot_id             BIGINT NOT NULL,
+    stop_id                 TEXT NOT NULL,
+    stop_code               TEXT,
+    stop_name               TEXT,
+    stop_desc               TEXT,
+    stop_lat                DOUBLE,
+    stop_lon                DOUBLE,
+    zone_id                 TEXT,
+    stop_url                TEXT,
+    location_type           INTEGER,
+    parent_station          TEXT,
+    stop_timezone           TEXT,
+    wheelchair_boarding     INTEGER,
+    platform_code           TEXT,
+    PRIMARY KEY (snapshot_id, stop_id)
+);
+
+CREATE TABLE IF NOT EXISTS gtfs_static_routes (
+    snapshot_id             BIGINT NOT NULL,
+    route_id                TEXT NOT NULL,
+    agency_id               TEXT,
+    route_short_name        TEXT,
+    route_long_name         TEXT,
+    route_desc              TEXT,
+    route_type              INTEGER,
+    route_url               TEXT,
+    route_color             TEXT,
+    route_text_color        TEXT,
+    PRIMARY KEY (snapshot_id, route_id)
+);
+
+CREATE TABLE IF NOT EXISTS gtfs_static_trips (
+    snapshot_id             BIGINT NOT NULL,
+    route_id                TEXT NOT NULL,
+    service_id              TEXT NOT NULL,
+    trip_id                 TEXT NOT NULL,
+    trip_headsign           TEXT,
+    trip_short_name         TEXT,
+    direction_id            INTEGER,
+    block_id                TEXT,
+    shape_id                TEXT,
+    wheelchair_accessible   INTEGER,
+    bikes_allowed           INTEGER,
+    PRIMARY KEY (snapshot_id, trip_id)
+);
+
+CREATE TABLE IF NOT EXISTS gtfs_static_stop_times (
+    snapshot_id             BIGINT NOT NULL,
+    trip_id                 TEXT NOT NULL,
+    stop_sequence           INTEGER NOT NULL,
+    arrival_time            TEXT,
+    departure_time          TEXT,
+    stop_id                 TEXT NOT NULL,
+    stop_headsign           TEXT,
+    pickup_type             INTEGER,
+    drop_off_type           INTEGER,
+    continuous_pickup       INTEGER,
+    continuous_drop_off     INTEGER,
+    shape_dist_traveled     DOUBLE,
+    timepoint               INTEGER,
+    PRIMARY KEY (snapshot_id, trip_id, stop_sequence)
+);
+
+CREATE TABLE IF NOT EXISTS gtfs_static_shapes (
+    snapshot_id             BIGINT NOT NULL,
+    shape_id                TEXT NOT NULL,
+    shape_pt_sequence       INTEGER NOT NULL,
+    shape_pt_lat            DOUBLE,
+    shape_pt_lon            DOUBLE,
+    shape_dist_traveled     DOUBLE,
+    PRIMARY KEY (snapshot_id, shape_id, shape_pt_sequence)
+);
+
+CREATE TABLE IF NOT EXISTS gtfs_static_calendar (
+    snapshot_id             BIGINT NOT NULL,
+    service_id              TEXT NOT NULL,
+    monday                  INTEGER,
+    tuesday                 INTEGER,
+    wednesday               INTEGER,
+    thursday                INTEGER,
+    friday                  INTEGER,
+    saturday                INTEGER,
+    sunday                  INTEGER,
+    start_date              TEXT,
+    end_date                TEXT,
+    PRIMARY KEY (snapshot_id, service_id)
+);
+
+CREATE TABLE IF NOT EXISTS gtfs_static_calendar_dates (
+    snapshot_id             BIGINT NOT NULL,
+    service_id              TEXT NOT NULL,
+    date                    TEXT NOT NULL,
+    exception_type          INTEGER,
+    PRIMARY KEY (snapshot_id, service_id, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gtfs_static_snapshot_agency
+    ON gtfs_static_snapshot(agency, fetched_at_ms);
+CREATE INDEX IF NOT EXISTS idx_gtfs_static_stops_parent
+    ON gtfs_static_stops(snapshot_id, parent_station);
+CREATE INDEX IF NOT EXISTS idx_gtfs_static_stop_times_stop
+    ON gtfs_static_stop_times(snapshot_id, stop_id, arrival_time);
+CREATE INDEX IF NOT EXISTS idx_gtfs_static_trips_route
+    ON gtfs_static_trips(snapshot_id, route_id);
+CREATE INDEX IF NOT EXISTS idx_gtfs_static_shapes_shape
+    ON gtfs_static_shapes(snapshot_id, shape_id, shape_pt_sequence);
 """
 
 
@@ -1303,6 +1484,32 @@ _MIGRATIONS: tuple[tuple[str, str, str, str | None], ...] = (
     # Tier 0b: capture incident flags + stop description on arrival predictions.
     ("train_arrivals_raw", "flags",            "TEXT", None),
     ("train_arrivals_raw", "stop_description", "TEXT", None),
+    # Tier-1 data-capture widening: GTFS-RT TripUpdate fields previously dropped.
+    ("train_v2_gtfsrt_trip_update", "feed_timestamp_ms",          "BIGINT",  None),
+    ("train_v2_gtfsrt_trip_update", "feed_incrementality",        "TEXT",    None),
+    ("train_v2_gtfsrt_trip_update", "trip_update_timestamp_ms",   "BIGINT",  None),
+    ("train_v2_gtfsrt_trip_update", "trip_update_delay_seconds",  "INTEGER", None),
+    ("train_v2_gtfsrt_trip_update", "trip_start_date",            "TEXT",    None),
+    ("train_v2_gtfsrt_trip_update", "trip_start_time",            "TEXT",    None),
+    ("train_v2_gtfsrt_trip_update", "trip_direction_id",          "INTEGER", None),
+    ("train_v2_gtfsrt_trip_update", "trip_schedule_relationship", "TEXT",    None),
+    ("train_v2_gtfsrt_trip_update", "arrival_uncertainty_seconds",   "INTEGER", None),
+    ("train_v2_gtfsrt_trip_update", "departure_uncertainty_seconds", "INTEGER", None),
+    ("train_v2_gtfsrt_trip_update", "vehicle_label",              "TEXT",    None),
+    ("train_v2_gtfsrt_trip_update", "vehicle_license_plate",      "TEXT",    None),
+    # Tier-1 data-capture widening: GTFS-RT VehiclePosition fields previously dropped.
+    ("train_v2_gtfsrt_vehicle_position", "feed_timestamp_ms",          "BIGINT",  None),
+    ("train_v2_gtfsrt_vehicle_position", "feed_incrementality",        "TEXT",    None),
+    ("train_v2_gtfsrt_vehicle_position", "vehicle_timestamp_ms",       "BIGINT",  None),
+    ("train_v2_gtfsrt_vehicle_position", "stop_id",                    "TEXT",    None),
+    ("train_v2_gtfsrt_vehicle_position", "occupancy_percentage",       "INTEGER", None),
+    ("train_v2_gtfsrt_vehicle_position", "multi_carriage_details_json","TEXT",    None),
+    ("train_v2_gtfsrt_vehicle_position", "trip_start_date",            "TEXT",    None),
+    ("train_v2_gtfsrt_vehicle_position", "trip_start_time",            "TEXT",    None),
+    ("train_v2_gtfsrt_vehicle_position", "trip_direction_id",          "INTEGER", None),
+    ("train_v2_gtfsrt_vehicle_position", "trip_schedule_relationship", "TEXT",    None),
+    ("train_v2_gtfsrt_vehicle_position", "vehicle_license_plate",      "TEXT",    None),
+    ("train_v2_gtfsrt_vehicle_position", "odometer_m",                 "DOUBLE",  None),
 )
 
 

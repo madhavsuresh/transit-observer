@@ -347,6 +347,89 @@ def train_v2_status() -> None:
     click.echo(f"train_v2_line_topology rows: {topo}")
 
 
+@cli.group("gtfs-static")
+def gtfs_static_group() -> None:
+    """GTFS-static archive + extraction commands."""
+
+
+@gtfs_static_group.command("extract")
+@click.option("--agency", required=True, help="Agency tag, e.g. 'cta', 'metra', 'pace'.")
+@click.option("--archive", "archive_path", required=True, type=click.Path(exists=True),
+              help="Path to the GTFS .zip on disk.")
+@click.option("--replace/--no-replace", default=True,
+              help="If a snapshot with the same sha256 exists, replace its rows.")
+def gtfs_static_extract(agency, archive_path, replace) -> None:
+    """Parse a GTFS zip into the gtfs_static_* tables."""
+    from .gtfs_static_extract import extract_gtfs_archive
+
+    with db.writer() as conn:
+        snapshot_id = extract_gtfs_archive(
+            conn, agency=agency, archive_path=archive_path,
+            replace_existing=replace,
+        )
+    click.echo(f"snapshot_id = {snapshot_id}")
+
+
+@gtfs_static_group.command("extract-latest")
+@click.option("--agency", help="Restrict to one agency (default: all).")
+def gtfs_static_extract_latest(agency) -> None:
+    """Extract the latest archived GTFS zip per agency."""
+    from .gtfs_static_extract import extract_gtfs_archive
+    from pathlib import Path
+
+    with db.writer() as conn:
+        params: list = []
+        where = ""
+        if agency:
+            where = "WHERE agency = ?"
+            params.append(agency)
+        rows = conn.execute(
+            f"""
+            SELECT agency, archive_path, downloaded_at
+              FROM gtfs_feed_versions {where}
+             QUALIFY ROW_NUMBER() OVER (PARTITION BY agency ORDER BY downloaded_at DESC) = 1
+            """,
+            params,
+        ).fetchall()
+        n = 0
+        for agency_name, archive_path, downloaded_at in rows:
+            sid = extract_gtfs_archive(
+                conn,
+                agency=str(agency_name),
+                archive_path=Path(str(archive_path)),
+                fetched_at_ms=int(downloaded_at.timestamp() * 1000) if downloaded_at else None,
+            )
+            click.echo(f"{agency_name}: snapshot_id={sid}")
+            n += 1
+    click.echo(f"extracted {n} archive(s)")
+
+
+@gtfs_static_group.command("status")
+def gtfs_static_status() -> None:
+    """Show GTFS-static snapshot counts per agency."""
+    with db.reader() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'gtfs_static_snapshot' LIMIT 1"
+        ).fetchone():
+            click.echo("no gtfs_static_snapshot table yet")
+            return
+        rows = conn.execute(
+            """
+            SELECT agency,
+                   COUNT(*) AS n_snapshots,
+                   MAX(extracted_at_ms) AS last_extracted_ms,
+                   SUM(n_stop_times) AS total_stop_times,
+                   SUM(n_stops) AS total_stops
+              FROM gtfs_static_snapshot
+             GROUP BY agency
+             ORDER BY agency
+            """
+        ).fetchall()
+    click.echo("gtfs_static_snapshot by agency:")
+    for agency, n, last_ms, stop_times, stops in rows:
+        click.echo(f"  {agency:<10} snapshots={n} stops={stops} stop_times={stop_times}")
+
+
 @cli.command()
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8001, show_default=True, type=int,
