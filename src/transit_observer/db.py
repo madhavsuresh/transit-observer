@@ -604,6 +604,348 @@ CREATE INDEX IF NOT EXISTS idx_positions_run_polled
     ON train_positions_raw(line, run_number, polled_at);
 CREATE INDEX IF NOT EXISTS idx_outcomes_predictor
     ON forecast_queue(predictor_version, line, direction_code, leave_at);
+
+-- ============================================================
+-- CTA Bus Tracker v3 parallel pipeline.
+-- See src/transit_observer/bus_v3/ for the ingest + estimator code.
+-- All timestamps are stored as BIGINT ms epochs (CTA server-native;
+-- avoids tz conversions in hot inference loops). All stop IDs are
+-- TEXT to match the API surface (v2 INTEGER stop_id tables live in
+-- a parallel namespace and are not migrated).
+-- ============================================================
+
+CREATE SEQUENCE IF NOT EXISTS bus_v3_api_poll_seq;
+CREATE TABLE IF NOT EXISTS bus_v3_api_poll (
+    poll_id                 BIGINT PRIMARY KEY DEFAULT nextval('bus_v3_api_poll_seq'),
+    run_id                  TEXT NOT NULL,
+    cycle_index             INTEGER,
+    endpoint                TEXT NOT NULL,
+    query_kind              TEXT,
+    request_url_redacted    TEXT,
+    params_json_redacted    TEXT NOT NULL,
+    local_request_start_ms  BIGINT NOT NULL,
+    local_response_end_ms   BIGINT NOT NULL,
+    cta_server_time_ms      BIGINT,
+    http_status             INTEGER,
+    latency_ms              DOUBLE,
+    ok                      BOOLEAN NOT NULL DEFAULT FALSE,
+    error_message           TEXT,
+    raw_json                TEXT,
+    raw_sha256              TEXT,
+    created_at_ms           BIGINT NOT NULL
+);
+
+CREATE SEQUENCE IF NOT EXISTS bus_v3_api_error_seq;
+CREATE TABLE IF NOT EXISTS bus_v3_api_error (
+    api_error_id    BIGINT PRIMARY KEY DEFAULT nextval('bus_v3_api_error_seq'),
+    poll_id         BIGINT NOT NULL,
+    endpoint        TEXT NOT NULL,
+    rt              TEXT,
+    stpid           TEXT,
+    vid             TEXT,
+    msg             TEXT NOT NULL,
+    raw_json        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bus_v3_route (
+    rt                  TEXT PRIMARY KEY,
+    rtnm                TEXT,
+    rtclr               TEXT,
+    rtdd                TEXT,
+    first_seen_poll_id  BIGINT,
+    last_seen_poll_id   BIGINT,
+    raw_json            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bus_v3_direction (
+    rt                  TEXT NOT NULL,
+    dir_id              TEXT NOT NULL,
+    name                TEXT,
+    first_seen_poll_id  BIGINT,
+    last_seen_poll_id   BIGINT,
+    raw_json            TEXT,
+    PRIMARY KEY (rt, dir_id)
+);
+
+CREATE TABLE IF NOT EXISTS bus_v3_stop (
+    stpid               TEXT PRIMARY KEY,
+    stpnm               TEXT,
+    lat                 DOUBLE,
+    lon                 DOUBLE,
+    rt                  TEXT,
+    rtdir               TEXT,
+    dtradd_json         TEXT,
+    dtrrem_json         TEXT,
+    first_seen_poll_id  BIGINT,
+    last_seen_poll_id   BIGINT,
+    raw_json            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bus_v3_pattern (
+    pid                 INTEGER PRIMARY KEY,
+    rt                  TEXT,
+    rtdir               TEXT,
+    length_ft           DOUBLE,
+    dtrid               TEXT,
+    first_seen_poll_id  BIGINT,
+    last_seen_poll_id   BIGINT,
+    raw_json            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bus_v3_pattern_point (
+    pid                         INTEGER NOT NULL,
+    seq                         INTEGER NOT NULL,
+    typ                         TEXT,
+    stpid                       TEXT,
+    stpnm                       TEXT,
+    lat                         DOUBLE,
+    lon                         DOUBLE,
+    pdist_ft                    DOUBLE,
+    is_detour_original_point    INTEGER DEFAULT 0,
+    raw_json                    TEXT,
+    PRIMARY KEY (pid, seq, is_detour_original_point)
+);
+
+CREATE TABLE IF NOT EXISTS bus_v3_detour (
+    detour_pk           TEXT PRIMARY KEY,
+    id                  TEXT NOT NULL,
+    ver                 INTEGER,
+    state               INTEGER,
+    descr               TEXT,
+    route_dirs_json     TEXT,
+    startdt_ms          BIGINT,
+    enddt_ms            BIGINT,
+    moddt_ms            BIGINT,
+    first_seen_poll_id  BIGINT,
+    last_seen_poll_id   BIGINT,
+    raw_json            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bus_v3_enhanced_detour_pattern (
+    detour_pk           TEXT NOT NULL,
+    origpid             INTEGER NOT NULL,
+    dtrpid              INTEGER NOT NULL,
+    encoded_polyline    TEXT,
+    delay_s             INTEGER,
+    raw_json            TEXT,
+    PRIMARY KEY (detour_pk, origpid, dtrpid)
+);
+
+CREATE TABLE IF NOT EXISTS bus_v3_enhanced_detour_trip (
+    detour_pk       TEXT NOT NULL,
+    tripid          TEXT,
+    tatripid        TEXT,
+    origtatripno    TEXT,
+    dates_json      TEXT,
+    stst            INTEGER,
+    raw_json        TEXT,
+    PRIMARY KEY (detour_pk, tripid, tatripid, origtatripno, stst)
+);
+
+CREATE TABLE IF NOT EXISTS bus_v3_enhanced_detour_replacement_stop (
+    detour_pk           TEXT NOT NULL,
+    role                TEXT NOT NULL,    -- 'start' | 'end' | 'replacement'
+    geoid               TEXT,
+    stpid               TEXT,
+    seq                 INTEGER,
+    stpnm               TEXT,
+    lat                 DOUBLE,
+    lon                 DOUBLE,
+    adhoc               INTEGER,
+    relpasstime_s       INTEGER,
+    raw_json            TEXT,
+    PRIMARY KEY (detour_pk, role, stpid, seq)
+);
+
+CREATE SEQUENCE IF NOT EXISTS bus_v3_vehicle_observation_seq;
+CREATE TABLE IF NOT EXISTS bus_v3_vehicle_observation (
+    vehicle_obs_id          BIGINT PRIMARY KEY DEFAULT nextval('bus_v3_vehicle_observation_seq'),
+    poll_id                 BIGINT NOT NULL,
+    run_id                  TEXT NOT NULL,
+    cta_server_time_ms      BIGINT,
+    local_response_end_ms   BIGINT NOT NULL,
+    vid                     TEXT NOT NULL,
+    tmstmp_ms               BIGINT,
+    vehicle_age_s           DOUBLE,
+    lat                     DOUBLE,
+    lon                     DOUBLE,
+    hdg                     DOUBLE,
+    pid                     INTEGER,
+    pdist_ft                DOUBLE,
+    rt                      TEXT,
+    des                     TEXT,
+    dly                     INTEGER,
+    tablockid               TEXT,
+    tatripid                TEXT,
+    origtatripno            TEXT,
+    zone                    TEXT,
+    mode                    INTEGER,
+    psgld                   TEXT,
+    stst                    INTEGER,
+    stsd                    TEXT,
+    raw_json                TEXT
+);
+
+CREATE SEQUENCE IF NOT EXISTS bus_v3_prediction_observation_seq;
+CREATE TABLE IF NOT EXISTS bus_v3_prediction_observation (
+    prediction_obs_id       BIGINT PRIMARY KEY DEFAULT nextval('bus_v3_prediction_observation_seq'),
+    poll_id                 BIGINT NOT NULL,
+    run_id                  TEXT NOT NULL,
+    cta_server_time_ms      BIGINT,
+    local_response_end_ms   BIGINT NOT NULL,
+    query_kind              TEXT,
+    tmstmp_ms               BIGINT,
+    prediction_age_s        DOUBLE,
+    typ                     TEXT,
+    stpid                   TEXT,
+    stpnm                   TEXT,
+    vid                     TEXT,
+    dstp_ft                 DOUBLE,
+    rt                      TEXT,
+    rtdd                    TEXT,
+    rtdir                   TEXT,
+    des                     TEXT,
+    prdtm_ms                BIGINT,
+    eta_s                   DOUBLE,
+    prdctdn_raw             TEXT,
+    prdctdn_min             DOUBLE,
+    dly                     INTEGER,
+    dyn                     INTEGER,
+    tablockid               TEXT,
+    tatripid                TEXT,
+    origtatripno            TEXT,
+    zone                    TEXT,
+    psgld                   TEXT,
+    stst                    INTEGER,
+    stsd                    TEXT,
+    flagstop                INTEGER,
+    raw_json                TEXT
+);
+
+CREATE SEQUENCE IF NOT EXISTS bus_v3_arrival_event_seq;
+CREATE TABLE IF NOT EXISTS bus_v3_arrival_event (
+    event_id                BIGINT PRIMARY KEY DEFAULT nextval('bus_v3_arrival_event_seq'),
+    run_id                  TEXT NOT NULL,
+    stpid                   TEXT NOT NULL,
+    rt                      TEXT,
+    rtdir                   TEXT,
+    vid                     TEXT,
+    pid                     INTEGER,
+    tatripid                TEXT,
+    origtatripno            TEXT,
+    tablockid               TEXT,
+    stst                    INTEGER,
+    stsd                    TEXT,
+    stop_pdist_ft           DOUBLE,
+    actual_arrival_ms       BIGINT,
+    label                   TEXT NOT NULL,
+    high_confidence         BOOLEAN NOT NULL DEFAULT FALSE,
+    confidence              DOUBLE NOT NULL DEFAULT 0,
+    evidence_json           TEXT NOT NULL,
+    reason_codes_json       TEXT NOT NULL,
+    first_vehicle_obs_id    BIGINT,
+    second_vehicle_obs_id   BIGINT,
+    created_at_ms           BIGINT NOT NULL
+);
+
+CREATE SEQUENCE IF NOT EXISTS bus_v3_online_estimate_seq;
+CREATE TABLE IF NOT EXISTS bus_v3_online_estimate (
+    estimate_id             BIGINT PRIMARY KEY DEFAULT nextval('bus_v3_online_estimate_seq'),
+    run_id                  TEXT,
+    generated_at_ms         BIGINT NOT NULL,
+    stpid                   TEXT NOT NULL,
+    rt                      TEXT,
+    rtdir                   TEXT,
+    vid                     TEXT,
+    tatripid                TEXT,
+    tablockid               TEXT,
+    predicted_arrival_ms    BIGINT,
+    interval80_low_ms       BIGINT,
+    interval80_high_ms      BIGINT,
+    interval90_low_ms       BIGINT,
+    interval90_high_ms      BIGINT,
+    interval95_low_ms       BIGINT,
+    interval95_high_ms      BIGINT,
+    reliability             DOUBLE NOT NULL,
+    display_state           TEXT NOT NULL,
+    data_quality            TEXT NOT NULL,
+    rider_message           TEXT,
+    reason_codes_json       TEXT NOT NULL,
+    features_json           TEXT NOT NULL,
+    raw_estimate_json       TEXT NOT NULL
+);
+
+CREATE SEQUENCE IF NOT EXISTS bus_v3_residual_quantile_seq;
+CREATE TABLE IF NOT EXISTS bus_v3_residual_quantile (
+    cal_id          BIGINT PRIMARY KEY DEFAULT nextval('bus_v3_residual_quantile_seq'),
+    created_at_ms   BIGINT NOT NULL,
+    rt              TEXT,
+    stpid           TEXT,
+    rtdir           TEXT,
+    horizon_bin     TEXT NOT NULL,
+    quality_bin     TEXT NOT NULL,
+    n               INTEGER NOT NULL,
+    q05_s           DOUBLE,
+    q10_s           DOUBLE,
+    q25_s           DOUBLE,
+    q50_s           DOUBLE,
+    q75_s           DOUBLE,
+    q90_s           DOUBLE,
+    q95_s           DOUBLE,
+    mae_s           DOUBLE,
+    bias_s          DOUBLE
+);
+
+CREATE SEQUENCE IF NOT EXISTS bus_v3_reliability_bin_seq;
+CREATE TABLE IF NOT EXISTS bus_v3_reliability_bin (
+    bin_id                          BIGINT PRIMARY KEY DEFAULT nextval('bus_v3_reliability_bin_seq'),
+    created_at_ms                   BIGINT NOT NULL,
+    run_id                          TEXT,
+    lower_bound                     DOUBLE NOT NULL,
+    upper_bound                     DOUBLE NOT NULL,
+    n                               INTEGER NOT NULL,
+    mean_predicted_reliability      DOUBLE,
+    empirical_success_rate          DOUBLE,
+    brier                           DOUBLE,
+    ece_component                   DOUBLE
+);
+
+CREATE INDEX IF NOT EXISTS idx_bus_v3_api_poll_run_endpoint
+    ON bus_v3_api_poll(run_id, endpoint, local_request_start_ms);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_api_poll_time
+    ON bus_v3_api_poll(local_request_start_ms);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_stop_rt_dir
+    ON bus_v3_stop(rt, rtdir);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_pattern_route_dir
+    ON bus_v3_pattern(rt, rtdir);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_pattern_dtrid
+    ON bus_v3_pattern(dtrid);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_pattern_point_stop
+    ON bus_v3_pattern_point(stpid, pid);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_pattern_point_pid_pdist
+    ON bus_v3_pattern_point(pid, pdist_ft);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_detour_id_state
+    ON bus_v3_detour(id, state);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_vehicle_obs_vid_time
+    ON bus_v3_vehicle_observation(vid, tmstmp_ms);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_vehicle_obs_run_rt
+    ON bus_v3_vehicle_observation(run_id, rt, local_response_end_ms);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_vehicle_obs_trip
+    ON bus_v3_vehicle_observation(vid, rt, pid, tatripid, tablockid, stsd, stst);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_prediction_obs_stop_time
+    ON bus_v3_prediction_observation(stpid, rt, rtdir, local_response_end_ms);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_prediction_obs_vid_stop_time
+    ON bus_v3_prediction_observation(vid, stpid, rt, tmstmp_ms);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_prediction_obs_trip
+    ON bus_v3_prediction_observation(vid, rt, stpid, tatripid, tablockid, stsd, stst);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_arrival_lookup
+    ON bus_v3_arrival_event(run_id, stpid, rt, rtdir, vid, actual_arrival_ms);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_arrival_high_conf
+    ON bus_v3_arrival_event(high_confidence, label);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_online_estimate_stop_time
+    ON bus_v3_online_estimate(stpid, rt, generated_at_ms);
+CREATE INDEX IF NOT EXISTS idx_bus_v3_residual_quantile_lookup
+    ON bus_v3_residual_quantile(rt, stpid, rtdir, horizon_bin, quality_bin, created_at_ms);
 """
 
 

@@ -40,6 +40,16 @@ class Settings:
     cta_alerts_poll_interval_seconds: float = 120.0       # service alerts feed; modest cadence is plenty
     cta_gtfsrt_poll_interval_seconds: float = 60.0        # CTA GTFS-RT TripUpdates + VehiclePositions
     bus_avl_poll_interval_seconds: float = 60.0           # getvehicles for monitored routes
+    # CTA Bus Tracker v3 parallel pipeline (alongside v2). See bus_v3/.
+    bus_v3_enabled: bool = True
+    bus_v3_interval_seconds: float = 30.0
+    bus_v3_near_interval_seconds: float = 15.0
+    bus_v3_metadata_refresh_seconds: float = 3600.0
+    bus_v3_detour_refresh_seconds: float = 300.0
+    bus_v3_predictions_by_vid_enabled: bool = True
+    bus_v3_max_stop_ids_per_request: int = 10
+    bus_v3_max_route_ids_per_request: int = 10
+    bus_v3_max_vehicle_ids_per_request: int = 10
     weather_poll_interval_seconds: float = 900.0          # 15 min × a few sites
     air_quality_poll_interval_seconds: float = 3600.0     # hourly
     social_poll_interval_seconds: float = 600.0           # 10 min, polite to Mastodon/Bluesky
