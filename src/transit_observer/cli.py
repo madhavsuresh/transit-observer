@@ -313,6 +313,23 @@ def train_v2_calibrate(min_n, predictor_version) -> None:
     click.echo(f"wrote {n} calibration cell(s)")
 
 
+@train_v2_group.command("parse-slow-zones")
+@click.option("--html-file", type=click.Path(exists=True),
+              help="Parse a specific HTML file (defaults to the latest snapshot in api_payloads_raw).")
+def train_v2_parse_slow_zones(html_file) -> None:
+    """Project the latest CTA slow-zone HTML snapshot into train_v2_slow_zone."""
+    from pathlib import Path
+
+    from .train_v2.slow_zone_parser import parse_slow_zones
+
+    html: str | None = None
+    if html_file:
+        html = Path(html_file).read_text(encoding="utf-8")
+    with db.writer() as conn:
+        n = parse_slow_zones(conn, html=html)
+    click.echo(f"upserted {n} slow-zone row(s)")
+
+
 @train_v2_group.command("status")
 def train_v2_status() -> None:
     """Show v2 train ingest, inference, and calibration counts."""

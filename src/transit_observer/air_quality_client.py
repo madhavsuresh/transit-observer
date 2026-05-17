@@ -1,12 +1,18 @@
 """AirNow API client (EPA / US-only free AQI data).
 
-Endpoint: ``https://www.airnowapi.org/aq/observation/zipCode/current/``
+Endpoints:
+- ``/aq/observation/zipCode/current/`` — current observed AQI per pollutant
+- ``/aq/forecast/zipCode/`` — same-day / next-day forecast AQI per pollutant
+
 Auth: free API key (env ``AIRNOW_API_KEY`` or ``[api_keys] airnow`` in
 ``config.toml``). Modest rate limit (500/hour), so the daily poll across
 a handful of zip codes is well within budget.
 
 Each (zip, hour) returns 1-3 observation rows (one per parameter:
-ozone, pm2.5, pm10) — we store them all.
+ozone, pm2.5, pm10) — we store them all. Tier-2 widening adds
+``category_number`` (numeric AQI category 1-6, the actionable form;
+Name is for display) and ``state_code`` (for cross-agency joins),
+plus a separate forecast capture.
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ from .config import CHICAGO
 
 
 BASE_URL = "https://www.airnowapi.org/aq/observation/zipCode/current/"
+FORECAST_URL = "https://www.airnowapi.org/aq/forecast/zipCode/"
 
 
 @dataclass(frozen=True)
@@ -31,10 +38,15 @@ class AirQualityObservation:
     raw_value: float | None
     unit: str | None
     category: str | None
+    category_number: int | None
+    state_code: str | None
     observation_time: datetime | None
     reporting_area: str | None
     latitude: float | None
     longitude: float | None
+    is_forecast: bool = False
+    forecast_date: str | None = None         # YYYY-MM-DD when ``is_forecast=True``
+    action_day: bool | None = None           # AirNow "action day" flag from forecast endpoint
 
 
 def _parse_int(value: Any) -> int | None:
@@ -106,6 +118,9 @@ class AirQualityClient:
                 continue
             category = raw.get("Category") or {}
             category_name = category.get("Name") if isinstance(category, dict) else None
+            category_number = (
+                _parse_int(category.get("Number")) if isinstance(category, dict) else None
+            )
             out.append(
                 AirQualityObservation(
                     site_id=zip_code,
@@ -114,10 +129,75 @@ class AirQualityClient:
                     raw_value=_parse_float(raw.get("RawConcentration")),
                     unit=raw.get("Unit"),
                     category=category_name,
+                    category_number=category_number,
+                    state_code=raw.get("StateCode"),
                     observation_time=_parse_dt(raw.get("DateObserved"), raw.get("HourObserved")),
                     reporting_area=raw.get("ReportingArea"),
                     latitude=_parse_float(raw.get("Latitude")),
                     longitude=_parse_float(raw.get("Longitude")),
+                    is_forecast=False,
+                    forecast_date=None,
+                    action_day=None,
+                )
+            )
+        return out
+
+    async def fetch_zip_forecast(
+        self, zip_code: str, *, distance_miles: int = 25,
+    ) -> list[AirQualityObservation]:
+        """Same-day + next-day AQI forecast per pollutant.
+
+        AirNow's forecast endpoint returns one row per (date, pollutant)
+        with a Discussion / ActionDay flag. We project them through the
+        same dataclass shape so they share the storage path; ``is_forecast``
+        and ``forecast_date`` distinguish them from current observations.
+        """
+        params = {
+            "format": "application/json",
+            "zipCode": zip_code,
+            "distance": str(distance_miles),
+            "API_KEY": self._key,
+        }
+        resp = await self._http.get(FORECAST_URL, params=params)
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, list):
+            return []
+        out: list[AirQualityObservation] = []
+        for raw in payload:
+            parameter = raw.get("ParameterName")
+            if not parameter:
+                continue
+            category = raw.get("Category") or {}
+            category_name = category.get("Name") if isinstance(category, dict) else None
+            category_number = (
+                _parse_int(category.get("Number")) if isinstance(category, dict) else None
+            )
+            date_str = raw.get("DateForecast") or raw.get("DateIssue")
+            action_day_raw = raw.get("ActionDay")
+            if isinstance(action_day_raw, str):
+                action_day = action_day_raw.strip().lower() in {"true", "1", "yes", "y"}
+            elif isinstance(action_day_raw, bool):
+                action_day = action_day_raw
+            else:
+                action_day = None
+            out.append(
+                AirQualityObservation(
+                    site_id=zip_code,
+                    parameter=str(parameter).lower(),
+                    aqi=_parse_int(raw.get("AQI")),
+                    raw_value=None,
+                    unit=None,
+                    category=category_name,
+                    category_number=category_number,
+                    state_code=raw.get("StateCode"),
+                    observation_time=None,
+                    reporting_area=raw.get("ReportingArea"),
+                    latitude=_parse_float(raw.get("Latitude")),
+                    longitude=_parse_float(raw.get("Longitude")),
+                    is_forecast=True,
+                    forecast_date=date_str.strip() if isinstance(date_str, str) else None,
+                    action_day=action_day,
                 )
             )
         return out
