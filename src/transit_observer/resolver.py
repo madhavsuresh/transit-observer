@@ -258,6 +258,25 @@ def _endpoint_signal(
         return 1.5 * approaching + 1.0 * plain + 0.5 * scheduled
 
     if f.mode == "bus":
+        # If the v3 pipeline has a high-confidence pdist-crossing for this
+        # stop within ±60s of the endpoint, treat it as gold-standard ground
+        # truth and saturate the signal.
+        stpid_txt = f.boarding_text_id if side == "boarding" else f.alighting_text_id
+        if stpid_txt is not None:
+            hc_lo_ms = int((ts - timedelta(seconds=60)).timestamp() * 1000)
+            hc_hi_ms = int((ts + timedelta(seconds=60)).timestamp() * 1000)
+            hc = conn.execute(
+                """
+                SELECT COUNT(*) FROM bus_v3_arrival_event
+                 WHERE stpid = ? AND rt = ?
+                   AND high_confidence = TRUE
+                   AND actual_arrival_ms BETWEEN ? AND ?
+                """,
+                [str(stpid_txt), f.line, hc_lo_ms, hc_hi_ms],
+            ).fetchone()
+            if hc and (hc[0] or 0) > 0:
+                return float(_TRUTH_SCORE_CAP)
+
         stop_id = int(f.boarding_text_id if side == "boarding" else (f.alighting_text_id or 0) or 0)
         rows = conn.execute(
             """

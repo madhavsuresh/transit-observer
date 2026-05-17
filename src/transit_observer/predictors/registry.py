@@ -23,6 +23,7 @@ import structlog
 from ..config import settings
 from ..corridors import Corridor
 
+from .bus_telemetry import BUS_TELEMETRY_VERSION, BusTelemetryPredictor
 from .journey_kernel import (
     KERNEL_EB_VERSION,
     KERNEL_VERSION,
@@ -53,6 +54,8 @@ def _instantiate(version: str) -> Predictor | None:
         return JourneyKernelPredictor()
     if version == KERNEL_EB_VERSION:
         return JourneyKernelEBPredictor()
+    if version == BUS_TELEMETRY_VERSION:
+        return BusTelemetryPredictor()
     if version == GBM_VERSION or version.startswith("gbm-"):
         root = _models_root()
         if not (root / version).is_dir():
@@ -288,7 +291,7 @@ def candidate_versions(conn: duckdb.DuckDBPyConnection) -> list[str]:
          WHERE predictor_version IS NOT NULL
         """
     ).fetchall()
-    versions = {KERNEL_VERSION, KERNEL_EB_VERSION}
+    versions = {KERNEL_VERSION, KERNEL_EB_VERSION, BUS_TELEMETRY_VERSION}
     for (v,) in rows:
         if v:
             versions.add(str(v))

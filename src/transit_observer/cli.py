@@ -196,6 +196,76 @@ def calibration(bins: int) -> None:
         click.echo(f"{b.predicted_lower:>6.2f}{b.predicted_upper:>7.2f}  {b.n:>5}  {b.actual_failure_rate:>6.1%}")
 
 
+@cli.group("bus-v3")
+def bus_v3_group() -> None:
+    """CTA Bus Tracker v3 parallel pipeline commands."""
+
+
+@bus_v3_group.command("infer-arrivals")
+@click.option("--run-id", default=None, help="Restrict to a single v3 cycle run_id.")
+@click.option("--route", default=None, help="Restrict to a single CTA route.")
+@click.option("--stop", default=None, help="Restrict to a single stop ID.")
+@click.option("--direction", default=None, help="Restrict to a single rtdir.")
+@click.option("--replace", is_flag=True, default=False,
+              help="Delete prior events for the run_id before re-inferring.")
+def bus_v3_infer_arrivals(run_id, route, stop, direction, replace) -> None:
+    """Run pdist-crossing arrival inference over bus_v3_* tables."""
+    from .bus_v3.inference import infer_bus_arrivals
+
+    with db.writer() as conn:
+        n = infer_bus_arrivals(
+            conn, run_id=run_id, route=route, stop_id=stop, direction=direction, replace=replace,
+        )
+    click.echo(f"inferred {n} arrival event(s)")
+
+
+@bus_v3_group.command("calibrate")
+@click.option("--min-n", default=20, show_default=True, type=int,
+              help="Minimum sample count per (rt, stpid, rtdir, horizon_bin, quality_bin) cell.")
+@click.option("--predictor-version", default="bus-telemetry-v1", show_default=True)
+def bus_v3_calibrate(min_n, predictor_version) -> None:
+    """Refresh the bus_v3_residual_quantile empirical calibration table."""
+    from .bus_v3.calibration import refresh_bus_residual_quantiles
+
+    with db.writer() as conn:
+        n = refresh_bus_residual_quantiles(
+            conn, min_n=min_n, predictor_version=predictor_version,
+        )
+    click.echo(f"wrote {n} calibration cell(s)")
+
+
+@bus_v3_group.command("status")
+def bus_v3_status() -> None:
+    """Show v3 ingest, inference, and calibration counts."""
+    with db.reader() as conn:
+        rows = conn.execute(
+            """
+            SELECT endpoint, COUNT(*) AS n, MAX(local_response_end_ms) AS last_ms
+              FROM bus_v3_api_poll
+             GROUP BY endpoint
+             ORDER BY endpoint
+            """
+        ).fetchall()
+        events = conn.execute(
+            """
+            SELECT label,
+                   SUM(CASE WHEN high_confidence THEN 1 ELSE 0 END) AS high,
+                   COUNT(*) AS total
+              FROM bus_v3_arrival_event
+             GROUP BY label
+             ORDER BY label
+            """
+        ).fetchall()
+        cal = conn.execute("SELECT COUNT(*) FROM bus_v3_residual_quantile").fetchone()[0]
+    click.echo("bus_v3_api_poll by endpoint:")
+    for endpoint, n, _last in rows:
+        click.echo(f"  {endpoint:<25} {n}")
+    click.echo("\nbus_v3_arrival_event by label:")
+    for label, high, total in events:
+        click.echo(f"  {label:<40} high={high} total={total}")
+    click.echo(f"\nbus_v3_residual_quantile rows: {cal}")
+
+
 @cli.command()
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8001, show_default=True, type=int,

@@ -311,6 +311,117 @@ def _predictor_scoreboard_df(min_samples: int = 30) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=30)
+def _bus_v3_status_df() -> pd.DataFrame:
+    """Top-line v3 ingest counts per endpoint."""
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        rows = conn.execute(
+            """
+            SELECT endpoint,
+                   COUNT(*) AS polls,
+                   SUM(CASE WHEN ok THEN 1 ELSE 0 END) AS ok_polls,
+                   MAX(local_response_end_ms) AS last_response_ms
+              FROM bus_v3_api_poll
+             GROUP BY endpoint
+             ORDER BY endpoint
+            """
+        ).fetchall()
+    return pd.DataFrame(
+        [
+            {"endpoint": e, "polls": int(p), "ok_polls": int(o or 0), "last_response_ms": int(l or 0)}
+            for e, p, o, l in rows
+        ]
+    )
+
+
+@st.cache_data(ttl=30)
+def _bus_v3_arrival_label_df() -> pd.DataFrame:
+    """Counts of bus_v3_arrival_event rows broken out by label."""
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        rows = conn.execute(
+            """
+            SELECT label,
+                   SUM(CASE WHEN high_confidence THEN 1 ELSE 0 END) AS high_conf,
+                   COUNT(*) AS total
+              FROM bus_v3_arrival_event
+             GROUP BY label
+             ORDER BY label
+            """
+        ).fetchall()
+    return pd.DataFrame(
+        [{"label": l, "high_confidence": int(h or 0), "total": int(t or 0)} for l, h, t in rows]
+    )
+
+
+@st.cache_data(ttl=30)
+def _bus_v3_residual_df() -> pd.DataFrame:
+    """Latest residual quantile rows."""
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        rows = conn.execute(
+            """
+            SELECT rt, stpid, rtdir, horizon_bin, quality_bin, n,
+                   q10_s, q50_s, q90_s, mae_s, bias_s
+              FROM bus_v3_residual_quantile
+             ORDER BY created_at_ms DESC, rt, stpid, rtdir
+             LIMIT 200
+            """
+        ).fetchall()
+    return pd.DataFrame(
+        [
+            {
+                "rt": rt, "stpid": stpid, "rtdir": rtdir,
+                "horizon_bin": hbin, "quality_bin": qbin, "n": int(n),
+                "q10_s": q10, "q50_s": q50, "q90_s": q90,
+                "mae_s": mae, "bias_s": bias,
+            }
+            for rt, stpid, rtdir, hbin, qbin, n, q10, q50, q90, mae, bias in rows
+        ]
+    )
+
+
+def _render_bus_v3_tab() -> None:
+    """Read-only summary of the CTA Bus Tracker v3 pipeline."""
+    st.subheader("CTA Bus Tracker v3 pipeline")
+    st.caption(
+        "Parallel to the legacy v2 path. Vehicle pdist-crossings give "
+        "high-confidence ground truth; ``bus-telemetry-v1`` is the "
+        "predictor that consumes it via the registry."
+    )
+    status = _bus_v3_status_df()
+    if status.empty:
+        st.info(
+            "No v3 polls yet. Enable in settings and confirm "
+            "``CTA_BUS_API_KEY`` is set."
+        )
+        return
+    st.markdown("**Ingest counts (per endpoint)**")
+    st.dataframe(status, use_container_width=True, hide_index=True)
+    arrivals = _bus_v3_arrival_label_df()
+    if not arrivals.empty:
+        st.markdown("**Arrival events by label**")
+        st.dataframe(arrivals, use_container_width=True, hide_index=True)
+        st.caption(
+            "``ARRIVED_CONFIRMED`` rows are the only ones used for "
+            "accuracy metrics by default. Everything else is recorded "
+            "for diagnostics."
+        )
+    residuals = _bus_v3_residual_df()
+    if not residuals.empty:
+        st.markdown("**Residual calibration (latest 200 cells)**")
+        st.dataframe(residuals, use_container_width=True, hide_index=True)
+        st.caption(
+            "Empirical residual seconds (actual − predicted) per "
+            "``(rt, stpid, rtdir, horizon_bin, quality_bin)`` stratum. "
+            "Run ``transit bus-v3 calibrate`` to refresh."
+        )
+
+
 def _render_live_forecast_tab() -> None:
     """Interactive: pick a seeded corridor, predict, dotplot.
 
@@ -697,6 +808,7 @@ def _render() -> None:
         "Coverage map",
         "Sharpness ↔ coverage",
         "Live forecast",
+        "Bus v3 telemetry",
     ])
     with tabs[0]:
         view = st.radio(
@@ -806,6 +918,8 @@ def _render() -> None:
             )
     with tabs[4]:
         _render_live_forecast_tab()
+    with tabs[5]:
+        _render_bus_v3_tab()
 
     st.divider()
     _render_predictors_section()

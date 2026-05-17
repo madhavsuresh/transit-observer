@@ -30,6 +30,10 @@ from .alerts_client import CTAAlertsClient
 from .auto_upgrade import promote_popular
 from .bus_client import CTABusClient
 from .bus_predictor import build_observed_bus_runs
+from .bus_v3 import catalog as bus_v3_catalog
+from .bus_v3 import collector as bus_v3_collector
+from .bus_v3.client import CTABusV3Client
+from .bus_v3.inference import infer_bus_arrivals
 from .catalog import LStation, load_catalog
 from .config import CHICAGO, Settings, settings
 from .corpus import predict_and_enqueue_corridor
@@ -72,6 +76,8 @@ async def run(stngs: Settings = settings) -> None:
     last_positions_poll = datetime.now(CHICAGO)
     last_bus_poll = datetime.now(CHICAGO)
     last_bus_avl_poll = datetime.now(CHICAGO) - timedelta(seconds=stngs.bus_avl_poll_interval_seconds)
+    last_bus_v3_poll = datetime.now(CHICAGO) - timedelta(seconds=stngs.bus_v3_interval_seconds)
+    bus_v3_state = bus_v3_collector.BusV3CycleState()
     last_metra_poll = datetime.now(CHICAGO)
     last_intercampus_poll = datetime.now(CHICAGO)
     last_query_import = datetime.now(CHICAGO)
@@ -108,6 +114,11 @@ async def run(stngs: Settings = settings) -> None:
                 payload_recorder=make_response_recorder(conn, source="cta_bus"),
             )
             if stngs.cta_bus_api_key
+            else None
+        )
+        bus_v3_client = (
+            CTABusV3Client(stngs.cta_bus_api_key)
+            if stngs.cta_bus_api_key and stngs.bus_v3_enabled
             else None
         )
         metra_client = (
@@ -187,6 +198,52 @@ async def run(stngs: Settings = settings) -> None:
                     if n_avl:
                         log.info("bus_avl.polled", n=n_avl)
                     last_bus_avl_poll = tick_started
+
+                # Bus Tracker v3 parallel pipeline. Independent cadence; the
+                # collector runs it alongside the v2 path so head-to-head
+                # predictor metrics keep both views populated.
+                bus_v3_due_seconds = (
+                    stngs.bus_v3_near_interval_seconds
+                    if bus_v3_state.cycle_index > 0 and getattr(bus_v3_state, "last_near_arrival", False)
+                    else stngs.bus_v3_interval_seconds
+                )
+                if (
+                    bus_v3_client
+                    and stngs.monitored_bus_stops
+                    and (tick_started - last_bus_v3_poll).total_seconds() >= bus_v3_due_seconds
+                ):
+                    cycle_summary = await _run_bus_v3_cycle(
+                        conn,
+                        bus_v3_client,
+                        stngs=stngs,
+                        state=bus_v3_state,
+                    )
+                    last_bus_v3_poll = tick_started
+                    bus_v3_state.last_near_arrival = cycle_summary.near_arrival
+                    if cycle_summary.polls_recorded:
+                        log.info(
+                            "bus_v3.polled",
+                            run=cycle_summary.run_id,
+                            polls=cycle_summary.polls_recorded,
+                            vids=len(cycle_summary.prediction_vids),
+                            near=cycle_summary.near_arrival,
+                        )
+                    if cycle_summary.run_id and cycle_summary.polls_recorded:
+                        try:
+                            n_inferred = infer_bus_arrivals(
+                                conn,
+                                run_id=cycle_summary.run_id,
+                                replace=False,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("bus_v3.inference_failed", err=str(exc))
+                            n_inferred = 0
+                        if n_inferred:
+                            log.info(
+                                "bus_v3.arrivals_inferred",
+                                run=cycle_summary.run_id,
+                                events=n_inferred,
+                            )
 
                 if metra_client and (tick_started - last_metra_poll).total_seconds() >= stngs.metra_poll_interval_seconds:
                     n_metra = await _poll_metra(conn, metra_client)
@@ -387,6 +444,8 @@ async def run(stngs: Settings = settings) -> None:
             await client.aclose()
             if bus_client:
                 await bus_client.aclose()
+            if bus_v3_client:
+                await bus_v3_client.aclose()
             if metra_client:
                 await metra_client.aclose()
             await intercampus_client.aclose()
@@ -532,6 +591,43 @@ async def _poll_bus(
         rows,
     )
     return len(rows)
+
+
+async def _run_bus_v3_cycle(
+    conn: duckdb.DuckDBPyConnection,
+    client: CTABusV3Client,
+    *,
+    stngs: Settings,
+    state: bus_v3_collector.BusV3CycleState,
+) -> bus_v3_collector.BusV3CycleResult:
+    """One v3 cycle: gettime → metadata (cadenced) → predictions/vehicles → by-vid.
+
+    All ``bus_v3_*`` rows are written here. The function is a thin wrapper
+    around :func:`bus_v3.collector.poll_once` that resolves targets from
+    settings and threads ``state`` between calls.
+    """
+    targets = bus_v3_catalog.targets_from_monitored_stops(stngs.monitored_bus_stops)
+    config = bus_v3_collector.BusV3CycleConfig(
+        targets=targets,
+        metadata_refresh_seconds=stngs.bus_v3_metadata_refresh_seconds,
+        detour_refresh_seconds=stngs.bus_v3_detour_refresh_seconds,
+        max_stop_ids_per_request=stngs.bus_v3_max_stop_ids_per_request,
+        max_vehicle_ids_per_request=stngs.bus_v3_max_vehicle_ids_per_request,
+        max_route_ids_per_request=stngs.bus_v3_max_route_ids_per_request,
+        predictions_by_vid_enabled=stngs.bus_v3_predictions_by_vid_enabled,
+    )
+    try:
+        return await bus_v3_collector.poll_once(conn, client, config=config, state=state)
+    except Exception as exc:  # noqa: BLE001 — never let the v3 path kill the loop
+        log.warning("bus_v3.cycle_failed", err=str(exc))
+        return bus_v3_collector.BusV3CycleResult(
+            run_id=state.last_run_id or "",
+            cycle_index=state.cycle_index,
+            server_ms=None,
+            prediction_vids=[],
+            near_arrival=False,
+            polls_recorded=0,
+        )
 
 
 async def _poll_metra(
