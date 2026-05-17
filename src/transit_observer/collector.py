@@ -45,6 +45,14 @@ from .train_v2.normalize import (
     normalize_gtfsrt_vehicle_positions,
 )
 from .train_v2.slow_zone_parser import parse_slow_zones
+from .cdot_traffic_client import CDOTTrafficClient, insert_cdot_observations
+from .cta_id_bridges import refresh_run_vehicle_links, refresh_station_id_map
+from .pace_gtfsrt import (
+    insert_pace_api_poll,
+    normalize_pace_alerts,
+    normalize_pace_trip_updates,
+    normalize_pace_vehicle_positions,
+)
 from .train_v2.models import ApiCallResult as TrainV2ApiCallResult
 from .train_v2.util import now_ms as _train_v2_now_ms
 from .catalog import LStation, load_catalog
@@ -94,6 +102,9 @@ async def run(stngs: Settings = settings) -> None:
     last_train_v2_poll = datetime.now(CHICAGO) - timedelta(seconds=stngs.train_v2_interval_seconds)
     last_train_v2_gtfsrt_poll = datetime.now(CHICAGO) - timedelta(seconds=stngs.train_v2_gtfsrt_interval_seconds)
     train_v2_state = train_v2_collector.TrainV2CycleState()
+    last_pace_gtfsrt_poll = datetime.now(CHICAGO) - timedelta(seconds=stngs.pace_gtfsrt_interval_seconds)
+    last_cdot_poll = datetime.now(CHICAGO) - timedelta(seconds=stngs.cdot_traffic_interval_seconds)
+    last_id_bridge_refresh = datetime.now(CHICAGO) - timedelta(seconds=stngs.id_bridge_refresh_seconds)
     last_metra_poll = datetime.now(CHICAGO)
     last_intercampus_poll = datetime.now(CHICAGO)
     last_query_import = datetime.now(CHICAGO)
@@ -182,6 +193,11 @@ async def run(stngs: Settings = settings) -> None:
                 payload_recorder=make_response_recorder(conn, source="ticketmaster"),
             )
             if stngs.ticketmaster_api_key
+            else None
+        )
+        cdot_traffic_client = (
+            CDOTTrafficClient(payload_recorder=make_response_recorder(conn, source="cdot_traffic"))
+            if stngs.cdot_traffic_enabled
             else None
         )
         rotation = itertools.cycle(catalog)
@@ -323,6 +339,57 @@ async def run(stngs: Settings = settings) -> None:
                             "train_v2.gtfsrt_polled",
                             trip_updates=n_tu, vehicle_positions=n_vp, alerts=n_al,
                         )
+
+                # Pace (suburban bus) GTFS-RT, on its own cadence.
+                if (
+                    stngs.cta_gtfsrt_feeds
+                    and (tick_started - last_pace_gtfsrt_poll).total_seconds() >= stngs.pace_gtfsrt_interval_seconds
+                ):
+                    n_p_tu, n_p_vp, n_p_al = await _run_pace_gtfsrt(
+                        conn,
+                        cta_gtfsrt_client,
+                        feeds=stngs.cta_gtfsrt_feeds,
+                        run_id=train_v2_state.last_run_id or "pace_gtfsrt",
+                        cycle_index=train_v2_state.cycle_index,
+                    )
+                    last_pace_gtfsrt_poll = tick_started
+                    if n_p_tu or n_p_vp or n_p_al:
+                        log.info(
+                            "pace.gtfsrt_polled",
+                            trip_updates=n_p_tu, vehicle_positions=n_p_vp, alerts=n_p_al,
+                        )
+
+                # CDOT live traffic congestion.
+                if (
+                    cdot_traffic_client
+                    and (tick_started - last_cdot_poll).total_seconds() >= stngs.cdot_traffic_interval_seconds
+                ):
+                    n_cdot_seg, n_cdot_reg = await _poll_cdot_traffic(
+                        conn, cdot_traffic_client,
+                        segment_limit=stngs.cdot_traffic_segment_limit,
+                        region_limit=stngs.cdot_traffic_region_limit,
+                    )
+                    last_cdot_poll = tick_started
+                    if n_cdot_seg or n_cdot_reg:
+                        log.info("cdot.polled", segments=n_cdot_seg, regions=n_cdot_reg)
+
+                # ID-bridge refresh: link Train Tracker run_numbers to
+                # GTFS-RT vehicle_ids, and project GTFS-static parent_station
+                # mapping into cta_station_id_map.
+                if (tick_started - last_id_bridge_refresh).total_seconds() >= stngs.id_bridge_refresh_seconds:
+                    try:
+                        n_links = refresh_run_vehicle_links(conn)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("id_bridges.run_vehicle_failed", err=str(exc))
+                        n_links = 0
+                    try:
+                        n_map = refresh_station_id_map(conn)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("id_bridges.station_map_failed", err=str(exc))
+                        n_map = 0
+                    last_id_bridge_refresh = tick_started
+                    if n_links or n_map:
+                        log.info("id_bridges.refreshed", links=n_links, station_map=n_map)
 
                 if metra_client and (tick_started - last_metra_poll).total_seconds() >= stngs.metra_poll_interval_seconds:
                     n_metra = await _poll_metra(conn, metra_client)
@@ -538,6 +605,8 @@ async def run(stngs: Settings = settings) -> None:
                 await bus_v3_client.aclose()
             if train_v2_client:
                 await train_v2_client.aclose()
+            if cdot_traffic_client:
+                await cdot_traffic_client.aclose()
             if metra_client:
                 await metra_client.aclose()
             await intercampus_client.aclose()
@@ -833,6 +902,101 @@ async def _run_train_v2_gtfsrt(
                 conn, poll_id, run_id, rows, local_response_end_ms=end,
             )
     return n_tu, n_vp, n_al
+
+
+async def _run_pace_gtfsrt(
+    conn: duckdb.DuckDBPyConnection,
+    client: CTAGtfsRtClient,
+    *,
+    feeds: tuple[tuple[str, str, str], ...],
+    run_id: str,
+    cycle_index: int,
+) -> tuple[int, int, int]:
+    """Pace GTFS-RT companion to :func:`_run_train_v2_gtfsrt`.
+
+    Reuses the same GTFS-RT client (the bindings are agency-neutral) but
+    writes to the ``pace_gtfsrt_*`` namespace so the train pipeline isn't
+    affected. Settings-driven via the existing ``cta_gtfsrt_feeds`` tuple
+    (just set ``mode='pace'`` for the Pace feed URLs).
+    """
+    n_tu = 0
+    n_vp = 0
+    n_al = 0
+    for mode, kind, url in feeds:
+        if mode != "pace":
+            continue
+        start = _train_v2_now_ms()
+        try:
+            if kind == "trip_updates":
+                rows = await client.fetch_trip_updates(url=url, mode="pace")
+            elif kind == "vehicle_positions":
+                rows = await client.fetch_vehicle_positions(url=url, mode="pace")
+            elif kind == "alerts":
+                rows = await client.fetch_alerts(url=url, mode="pace")
+            else:
+                continue
+            ok = True
+            err = None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("pace.gtfsrt_fetch_failed", url=url, kind=kind, err=str(exc))
+            rows = []
+            ok = False
+            err = str(exc)
+        end = _train_v2_now_ms()
+        poll_id = insert_pace_api_poll(
+            conn,
+            run_id=run_id,
+            cycle_index=cycle_index,
+            endpoint="gtfsrt",
+            query_kind=kind,
+            request_url_redacted=url,
+            local_request_start_ms=start,
+            local_response_end_ms=end,
+            http_status=200 if ok else None,
+            latency_ms=float(end - start),
+            ok=ok,
+            error_message=err,
+        )
+        if kind == "trip_updates":
+            n_tu += normalize_pace_trip_updates(
+                conn, poll_id, run_id, rows, local_response_end_ms=end,
+            )
+        elif kind == "vehicle_positions":
+            n_vp += normalize_pace_vehicle_positions(
+                conn, poll_id, run_id, rows, local_response_end_ms=end,
+            )
+        elif kind == "alerts":
+            n_al += normalize_pace_alerts(
+                conn, poll_id, run_id, rows, local_response_end_ms=end,
+            )
+    return n_tu, n_vp, n_al
+
+
+async def _poll_cdot_traffic(
+    conn: duckdb.DuckDBPyConnection,
+    client: CDOTTrafficClient,
+    *,
+    segment_limit: int,
+    region_limit: int,
+) -> tuple[int, int]:
+    """Snapshot CDOT's segment-level and region-level traffic feeds."""
+    n_seg = 0
+    n_reg = 0
+    try:
+        segments = await client.fetch_segments(limit=segment_limit)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cdot.segments_failed", err=str(exc))
+        segments = []
+    try:
+        regions = await client.fetch_regions(limit=region_limit)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cdot.regions_failed", err=str(exc))
+        regions = []
+    if segments:
+        n_seg = insert_cdot_observations(conn, segments)
+    if regions:
+        n_reg = insert_cdot_observations(conn, regions)
+    return n_seg, n_reg
 
 
 async def _poll_metra(
