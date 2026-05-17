@@ -1421,6 +1421,203 @@ CREATE INDEX IF NOT EXISTS idx_gtfs_static_trips_route
     ON gtfs_static_trips(snapshot_id, route_id);
 CREATE INDEX IF NOT EXISTS idx_gtfs_static_shapes_shape
     ON gtfs_static_shapes(snapshot_id, shape_id, shape_pt_sequence);
+
+-- ============================================================
+-- Tier-3: cross-stream ID bridges.
+--
+-- The CTA proprietary feeds and the GTFS-RT feeds use disjoint ID
+-- spaces. Without a bridge, the train estimator's GTFS-RT
+-- cross-validation is best-effort string-matching. These tables
+-- provide canonical joins:
+--   * train_v2_run_vehicle_link: ttpositions.aspx run_number (rn)
+--     <-> GTFS-RT vehicle.id, derived from co-located lat/lon at
+--     the same instant.
+--   * cta_station_id_map: ttarrivals.aspx staId (mapid) <-> GTFS
+--     parent_station + child stop_ids, precomputed from
+--     gtfs_static_stops.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS train_v2_run_vehicle_link (
+    line                    TEXT NOT NULL,
+    run_number              TEXT NOT NULL,
+    gtfsrt_vehicle_id       TEXT NOT NULL,
+    first_seen_ms           BIGINT NOT NULL,
+    last_seen_ms            BIGINT NOT NULL,
+    n_observations          INTEGER NOT NULL,
+    mean_haversine_m        DOUBLE,
+    max_haversine_m         DOUBLE,
+    PRIMARY KEY (line, run_number, gtfsrt_vehicle_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_train_v2_run_vehicle_link_recent
+    ON train_v2_run_vehicle_link(line, last_seen_ms);
+
+CREATE TABLE IF NOT EXISTS cta_station_id_map (
+    map_id                  TEXT NOT NULL,        -- ttarrivals.aspx staId
+    parent_station          TEXT,                  -- GTFS-static parent stop_id
+    child_stop_id           TEXT NOT NULL,        -- GTFS-static platform-level stop_id (1 row per platform)
+    child_stop_name         TEXT,
+    line                    TEXT,                  -- inferred from served_lines if available
+    lat                     DOUBLE,
+    lon                     DOUBLE,
+    snapshot_id             BIGINT NOT NULL,       -- gtfs_static snapshot this was derived from
+    PRIMARY KEY (map_id, child_stop_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cta_station_id_map_child
+    ON cta_station_id_map(child_stop_id);
+
+-- ============================================================
+-- Tier-3: Pace GTFS-RT (suburban bus). Mirrors train_v2_gtfsrt_*
+-- shape but in a pace_ namespace so the predictor / inference paths
+-- stay independent.
+-- ============================================================
+
+CREATE SEQUENCE IF NOT EXISTS pace_gtfsrt_api_poll_seq;
+CREATE TABLE IF NOT EXISTS pace_gtfsrt_api_poll (
+    poll_id                 BIGINT PRIMARY KEY DEFAULT nextval('pace_gtfsrt_api_poll_seq'),
+    run_id                  TEXT NOT NULL,
+    cycle_index             INTEGER,
+    endpoint                TEXT NOT NULL,
+    query_kind              TEXT,
+    request_url_redacted    TEXT,
+    local_request_start_ms  BIGINT NOT NULL,
+    local_response_end_ms   BIGINT NOT NULL,
+    http_status             INTEGER,
+    latency_ms              DOUBLE,
+    ok                      BOOLEAN NOT NULL DEFAULT FALSE,
+    error_message           TEXT,
+    created_at_ms           BIGINT NOT NULL
+);
+
+CREATE SEQUENCE IF NOT EXISTS pace_gtfsrt_trip_update_seq;
+CREATE TABLE IF NOT EXISTS pace_gtfsrt_trip_update (
+    trip_update_id          BIGINT PRIMARY KEY DEFAULT nextval('pace_gtfsrt_trip_update_seq'),
+    poll_id                 BIGINT NOT NULL,
+    run_id                  TEXT NOT NULL,
+    local_response_end_ms   BIGINT NOT NULL,
+    feed_timestamp_ms       BIGINT,
+    feed_incrementality     TEXT,
+    trip_update_timestamp_ms BIGINT,
+    trip_update_delay_seconds INTEGER,
+    route_id                TEXT,
+    trip_id                 TEXT,
+    trip_start_date         TEXT,
+    trip_start_time         TEXT,
+    trip_direction_id       INTEGER,
+    trip_schedule_relationship TEXT,
+    stop_id                 TEXT,
+    stop_sequence           INTEGER,
+    arrival_time_ms         BIGINT,
+    arrival_delay_seconds   INTEGER,
+    arrival_uncertainty_seconds INTEGER,
+    departure_time_ms       BIGINT,
+    departure_delay_seconds INTEGER,
+    departure_uncertainty_seconds INTEGER,
+    schedule_relationship   TEXT,
+    vehicle_id              TEXT,
+    vehicle_label           TEXT,
+    vehicle_license_plate   TEXT
+);
+
+CREATE SEQUENCE IF NOT EXISTS pace_gtfsrt_vehicle_position_seq;
+CREATE TABLE IF NOT EXISTS pace_gtfsrt_vehicle_position (
+    vehicle_position_id     BIGINT PRIMARY KEY DEFAULT nextval('pace_gtfsrt_vehicle_position_seq'),
+    poll_id                 BIGINT NOT NULL,
+    run_id                  TEXT NOT NULL,
+    local_response_end_ms   BIGINT NOT NULL,
+    feed_timestamp_ms       BIGINT,
+    feed_incrementality     TEXT,
+    vehicle_timestamp_ms    BIGINT,
+    route_id                TEXT,
+    trip_id                 TEXT,
+    trip_start_date         TEXT,
+    trip_start_time         TEXT,
+    trip_direction_id       INTEGER,
+    trip_schedule_relationship TEXT,
+    vehicle_id              TEXT,
+    vehicle_label           TEXT,
+    vehicle_license_plate   TEXT,
+    stop_id                 TEXT,
+    current_stop_sequence   INTEGER,
+    current_status          TEXT,
+    congestion_level        TEXT,
+    occupancy_status        TEXT,
+    occupancy_percentage    INTEGER,
+    multi_carriage_details_json TEXT,
+    lat                     DOUBLE,
+    lon                     DOUBLE,
+    bearing                 DOUBLE,
+    speed_mps               DOUBLE,
+    odometer_m              DOUBLE
+);
+
+CREATE SEQUENCE IF NOT EXISTS pace_gtfsrt_alert_seq;
+CREATE TABLE IF NOT EXISTS pace_gtfsrt_alert (
+    alert_id                BIGINT PRIMARY KEY DEFAULT nextval('pace_gtfsrt_alert_seq'),
+    poll_id                 BIGINT NOT NULL,
+    run_id                  TEXT NOT NULL,
+    local_response_end_ms   BIGINT NOT NULL,
+    feed_timestamp_ms       BIGINT,
+    feed_incrementality     TEXT,
+    entity_id               TEXT,
+    cause                   TEXT,
+    effect                  TEXT,
+    severity_level          TEXT,
+    header_text             TEXT,
+    description_text        TEXT,
+    tts_header_text         TEXT,
+    tts_description_text    TEXT,
+    url                     TEXT,
+    active_period_json      TEXT,
+    informed_entity_json    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pace_gtfsrt_trip_route
+    ON pace_gtfsrt_trip_update(route_id, stop_id, arrival_time_ms);
+CREATE INDEX IF NOT EXISTS idx_pace_gtfsrt_pos_vehicle_time
+    ON pace_gtfsrt_vehicle_position(vehicle_id, local_response_end_ms);
+CREATE INDEX IF NOT EXISTS idx_pace_gtfsrt_pos_route
+    ON pace_gtfsrt_vehicle_position(route_id, local_response_end_ms);
+
+-- ============================================================
+-- Tier-3: CDOT live traffic congestion.
+--
+-- Chicago Data Portal /resource/n4j6-wkkf (segment-level) and
+-- /resource/8v9j-bter (region-level). Updated every ~10 min by the
+-- city's TrafficTracker system. Each segment has a congestion score
+-- 0-9 (higher = worse) and an estimated speed.
+-- ============================================================
+
+CREATE SEQUENCE IF NOT EXISTS cdot_traffic_observation_seq;
+CREATE TABLE IF NOT EXISTS cdot_traffic_observation (
+    observation_id          BIGINT PRIMARY KEY DEFAULT nextval('cdot_traffic_observation_seq'),
+    polled_at_ms            BIGINT NOT NULL,
+    source                  TEXT NOT NULL,         -- 'cdot_segments' | 'cdot_regions'
+    segment_id              TEXT,                  -- segment id from the city feed
+    region                  TEXT,
+    street                  TEXT,
+    direction               TEXT,
+    from_street             TEXT,
+    to_street               TEXT,
+    speed                   DOUBLE,                -- estimated current MPH
+    bus_count               INTEGER,
+    message_count           INTEGER,
+    hour_of_day             INTEGER,
+    last_updated_ms         BIGINT,
+    start_lat               DOUBLE,
+    start_lon               DOUBLE,
+    end_lat                 DOUBLE,
+    end_lon                 DOUBLE,
+    raw_payload_json        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cdot_traffic_polled
+    ON cdot_traffic_observation(polled_at_ms);
+CREATE INDEX IF NOT EXISTS idx_cdot_traffic_segment
+    ON cdot_traffic_observation(segment_id, polled_at_ms);
+CREATE INDEX IF NOT EXISTS idx_cdot_traffic_region
+    ON cdot_traffic_observation(region, polled_at_ms);
 """
 
 

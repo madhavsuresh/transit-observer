@@ -68,6 +68,18 @@ class Settings:
     train_v2_platform_polling_enabled: bool = False
     train_v2_platforms_per_cycle: int = 4
     train_v2_platform_max_predictions: int = 8
+    # Tier-3 cross-stream ID bridges. Derivation is cheap and idempotent;
+    # run on a slow cadence so it doesn't compete with the live polls.
+    id_bridge_refresh_seconds: float = 900.0     # 15 min — fast enough that fresh runs get linked
+    # Tier-3 Pace GTFS-RT. Reuses cta_gtfsrt_feeds with ``mode='pace'``;
+    # cadence shared with CTA train GTFS-RT for simplicity.
+    pace_gtfsrt_interval_seconds: float = 60.0
+    # Tier-3 CDOT traffic. Free Chicago Data Portal endpoints, ~10 min
+    # update cadence on the city's side.
+    cdot_traffic_enabled: bool = True
+    cdot_traffic_interval_seconds: float = 600.0  # 10 minutes
+    cdot_traffic_segment_limit: int = 5000        # cap per poll to avoid surprise responses
+    cdot_traffic_region_limit: int = 100
     weather_poll_interval_seconds: float = 900.0          # 15 min × a few sites
     air_quality_poll_interval_seconds: float = 3600.0     # hourly
     social_poll_interval_seconds: float = 600.0           # 10 min, polite to Mastodon/Bluesky
