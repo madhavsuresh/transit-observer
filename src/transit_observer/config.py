@@ -50,6 +50,17 @@ class Settings:
     bus_v3_max_stop_ids_per_request: int = 10
     bus_v3_max_route_ids_per_request: int = 10
     bus_v3_max_vehicle_ids_per_request: int = 10
+    # CTA Train v2 parallel pipeline (alongside the legacy ttarrivals
+    # path). See train_v2/. Adds ttfollow.aspx (per-run trajectory) and
+    # GTFS-RT TripUpdates + VehiclePositions on top of the legacy
+    # ttarrivals + ttpositions streams.
+    train_v2_enabled: bool = True
+    train_v2_interval_seconds: float = 30.0
+    train_v2_arrivals_batch_size: int = 12          # stations polled per cycle (round-robin)
+    train_v2_arrivals_max_predictions: int = 12     # ``max`` param on each ttarrivals call
+    train_v2_follow_max_runs_per_cycle: int = 6     # cap ttfollow calls per cycle for budget safety
+    train_v2_gtfsrt_interval_seconds: float = 60.0  # GTFS-RT independent cadence
+    train_v2_topology_refresh_seconds: float = 86400.0  # daily rebuild from positions log
     weather_poll_interval_seconds: float = 900.0          # 15 min × a few sites
     air_quality_poll_interval_seconds: float = 3600.0     # hourly
     social_poll_interval_seconds: float = 600.0           # 10 min, polite to Mastodon/Bluesky

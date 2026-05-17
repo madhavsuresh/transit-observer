@@ -32,6 +32,7 @@ from .journey_kernel import (
 )
 from .protocol import Predictor
 from .quantile_gbm import GBM_VERSION, QuantileGBMPredictor
+from .train_telemetry import TRAIN_TELEMETRY_VERSION, TrainTelemetryPredictor
 
 
 log = structlog.get_logger(__name__)
@@ -56,6 +57,8 @@ def _instantiate(version: str) -> Predictor | None:
         return JourneyKernelEBPredictor()
     if version == BUS_TELEMETRY_VERSION:
         return BusTelemetryPredictor()
+    if version == TRAIN_TELEMETRY_VERSION:
+        return TrainTelemetryPredictor()
     if version == GBM_VERSION or version.startswith("gbm-"):
         root = _models_root()
         if not (root / version).is_dir():
@@ -291,7 +294,9 @@ def candidate_versions(conn: duckdb.DuckDBPyConnection) -> list[str]:
          WHERE predictor_version IS NOT NULL
         """
     ).fetchall()
-    versions = {KERNEL_VERSION, KERNEL_EB_VERSION, BUS_TELEMETRY_VERSION}
+    versions = {
+        KERNEL_VERSION, KERNEL_EB_VERSION, BUS_TELEMETRY_VERSION, TRAIN_TELEMETRY_VERSION,
+    }
     for (v,) in rows:
         if v:
             versions.add(str(v))

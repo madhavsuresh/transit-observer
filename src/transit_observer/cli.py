@@ -266,6 +266,87 @@ def bus_v3_status() -> None:
     click.echo(f"\nbus_v3_residual_quantile rows: {cal}")
 
 
+@cli.group("train-v2")
+def train_v2_group() -> None:
+    """CTA Train (L) v2 parallel pipeline commands."""
+
+
+@train_v2_group.command("infer-arrivals")
+@click.option("--run-id", default=None, help="Restrict to a single v2 cycle run_id.")
+@click.option("--replace", is_flag=True, default=False,
+              help="Delete prior events for the run_id before re-inferring.")
+def train_v2_infer_arrivals(run_id, replace) -> None:
+    """Run nextStaId-transition arrival inference over train_v2_* tables."""
+    from .train_v2.inference import infer_train_arrivals
+
+    with db.writer() as conn:
+        n = infer_train_arrivals(conn, run_id=run_id, replace=replace)
+    click.echo(f"inferred {n} arrival event(s)")
+
+
+@train_v2_group.command("topology")
+@click.option("--window-hours", default=168, show_default=True, type=int)
+@click.option("--min-transitions", default=3, show_default=True, type=int)
+def train_v2_topology(window_hours, min_transitions) -> None:
+    """Rebuild train_v2_line_topology from observed run transitions."""
+    from .train_v2.topology import refresh_line_topology
+
+    with db.writer() as conn:
+        n = refresh_line_topology(
+            conn, window_hours=window_hours, min_transitions=min_transitions,
+        )
+    click.echo(f"wrote {n} topology row(s)")
+
+
+@train_v2_group.command("calibrate")
+@click.option("--min-n", default=20, show_default=True, type=int,
+              help="Minimum sample count per (line, map_id, direction, horizon_bin, quality_bin) cell.")
+@click.option("--predictor-version", default="train-telemetry-v1", show_default=True)
+def train_v2_calibrate(min_n, predictor_version) -> None:
+    """Refresh the train_v2_residual_quantile empirical calibration table."""
+    from .train_v2.calibration import refresh_train_residual_quantiles
+
+    with db.writer() as conn:
+        n = refresh_train_residual_quantiles(
+            conn, min_n=min_n, predictor_version=predictor_version,
+        )
+    click.echo(f"wrote {n} calibration cell(s)")
+
+
+@train_v2_group.command("status")
+def train_v2_status() -> None:
+    """Show v2 train ingest, inference, and calibration counts."""
+    with db.reader() as conn:
+        rows = conn.execute(
+            """
+            SELECT source, endpoint, COUNT(*) AS n, MAX(local_response_end_ms) AS last_ms
+              FROM train_v2_api_poll
+             GROUP BY source, endpoint
+             ORDER BY source, endpoint
+            """
+        ).fetchall()
+        events = conn.execute(
+            """
+            SELECT label,
+                   SUM(CASE WHEN high_confidence THEN 1 ELSE 0 END) AS high,
+                   COUNT(*) AS total
+              FROM train_v2_arrival_event
+             GROUP BY label
+             ORDER BY label
+            """
+        ).fetchall()
+        cal = conn.execute("SELECT COUNT(*) FROM train_v2_residual_quantile").fetchone()[0]
+        topo = conn.execute("SELECT COUNT(*) FROM train_v2_line_topology").fetchone()[0]
+    click.echo("train_v2_api_poll by (source, endpoint):")
+    for source, endpoint, n, _last in rows:
+        click.echo(f"  {source:<14} {endpoint:<22} {n}")
+    click.echo("\ntrain_v2_arrival_event by label:")
+    for label, high, total in events:
+        click.echo(f"  {label:<40} high={high} total={total}")
+    click.echo(f"\ntrain_v2_residual_quantile rows: {cal}")
+    click.echo(f"train_v2_line_topology rows: {topo}")
+
+
 @cli.command()
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8001, show_default=True, type=int,

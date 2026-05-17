@@ -946,6 +946,300 @@ CREATE INDEX IF NOT EXISTS idx_bus_v3_online_estimate_stop_time
     ON bus_v3_online_estimate(stpid, rt, generated_at_ms);
 CREATE INDEX IF NOT EXISTS idx_bus_v3_residual_quantile_lookup
     ON bus_v3_residual_quantile(rt, stpid, rtdir, horizon_bin, quality_bin, created_at_ms);
+
+-- ============================================================
+-- CTA L (train) v2 parallel pipeline.
+-- See src/transit_observer/train_v2/ for the ingest + estimator code.
+-- Pulls from three independent CTA streams:
+--   1. Train Tracker ttarrivals.aspx (by-station predictions)
+--   2. Train Tracker ttfollow.aspx   (per-run trajectory — NEW)
+--   3. Train Tracker ttpositions.aspx (per-line vehicle positions)
+--   4. CTA GTFS-RT TripUpdates + VehiclePositions (independent stream
+--      with delay + congestion + current_status fields)
+-- Timestamps are BIGINT ms epochs. Stop and map IDs are stored as TEXT
+-- so future feeds with non-numeric IDs can land here unchanged.
+-- Legacy train_arrivals_raw / train_positions_raw stay untouched.
+-- ============================================================
+
+CREATE SEQUENCE IF NOT EXISTS train_v2_api_poll_seq;
+CREATE TABLE IF NOT EXISTS train_v2_api_poll (
+    poll_id                 BIGINT PRIMARY KEY DEFAULT nextval('train_v2_api_poll_seq'),
+    run_id                  TEXT NOT NULL,
+    cycle_index             INTEGER,
+    source                  TEXT NOT NULL,                  -- 'train_tracker' | 'gtfsrt_train'
+    endpoint                TEXT NOT NULL,
+    query_kind              TEXT,
+    request_url_redacted    TEXT,
+    params_json_redacted    TEXT NOT NULL,
+    local_request_start_ms  BIGINT NOT NULL,
+    local_response_end_ms   BIGINT NOT NULL,
+    cta_server_time_ms      BIGINT,
+    http_status             INTEGER,
+    latency_ms              DOUBLE,
+    ok                      BOOLEAN NOT NULL DEFAULT FALSE,
+    error_message           TEXT,
+    raw_json                TEXT,                           -- JSON body for tt*.aspx
+    raw_sha256              TEXT,
+    created_at_ms           BIGINT NOT NULL
+);
+
+CREATE SEQUENCE IF NOT EXISTS train_v2_arrival_observation_seq;
+CREATE TABLE IF NOT EXISTS train_v2_arrival_observation (
+    arrival_obs_id          BIGINT PRIMARY KEY DEFAULT nextval('train_v2_arrival_observation_seq'),
+    poll_id                 BIGINT NOT NULL,
+    run_id                  TEXT NOT NULL,
+    cta_server_time_ms      BIGINT,
+    local_response_end_ms   BIGINT NOT NULL,
+    query_kind              TEXT,
+    line                    TEXT,                           -- API line code: 'Red' | 'Blue' | …
+    run_number              TEXT,
+    map_id                  TEXT,
+    stop_id                 TEXT,
+    station_name            TEXT,
+    stop_description        TEXT,
+    direction_code          TEXT,
+    destination_name        TEXT,
+    destination_map_id      TEXT,
+    predicted_at_ms         BIGINT,                         -- ``prdt`` (when CTA produced the prediction)
+    arrival_at_ms           BIGINT,                         -- ``arrT`` (predicted arrival)
+    eta_s                   DOUBLE,                         -- arrival_at - server_time
+    prediction_age_s        DOUBLE,                         -- server_time - predicted_at
+    is_approaching          BOOLEAN,
+    is_delayed              BOOLEAN,
+    is_fault                BOOLEAN,
+    is_scheduled            BOOLEAN,
+    flags                   TEXT,
+    raw_json                TEXT
+);
+
+CREATE SEQUENCE IF NOT EXISTS train_v2_follow_observation_seq;
+CREATE TABLE IF NOT EXISTS train_v2_follow_observation (
+    follow_obs_id           BIGINT PRIMARY KEY DEFAULT nextval('train_v2_follow_observation_seq'),
+    poll_id                 BIGINT NOT NULL,
+    run_id                  TEXT NOT NULL,
+    cta_server_time_ms      BIGINT,
+    local_response_end_ms   BIGINT NOT NULL,
+    run_number              TEXT NOT NULL,
+    line                    TEXT,
+    seq                     INTEGER NOT NULL,                -- order of this stop in the follow response
+    map_id                  TEXT,
+    stop_id                 TEXT,
+    station_name            TEXT,
+    direction_code          TEXT,
+    destination_name        TEXT,
+    predicted_at_ms         BIGINT,
+    arrival_at_ms           BIGINT,
+    eta_s                   DOUBLE,
+    is_approaching          BOOLEAN,
+    is_delayed              BOOLEAN,
+    is_fault                BOOLEAN,
+    is_scheduled            BOOLEAN,
+    flags                   TEXT,
+    raw_json                TEXT
+);
+
+CREATE SEQUENCE IF NOT EXISTS train_v2_position_observation_seq;
+CREATE TABLE IF NOT EXISTS train_v2_position_observation (
+    position_obs_id         BIGINT PRIMARY KEY DEFAULT nextval('train_v2_position_observation_seq'),
+    poll_id                 BIGINT NOT NULL,
+    run_id                  TEXT NOT NULL,
+    cta_server_time_ms      BIGINT,
+    local_response_end_ms   BIGINT NOT NULL,
+    line                    TEXT,
+    run_number              TEXT,
+    direction_code          TEXT,
+    destination_name        TEXT,
+    destination_map_id      TEXT,
+    next_station_map_id     TEXT,
+    next_station_name       TEXT,
+    predicted_at_ms         BIGINT,
+    next_arrival_at_ms      BIGINT,
+    is_approaching          BOOLEAN,
+    is_delayed              BOOLEAN,
+    is_fault                BOOLEAN,
+    lat                     DOUBLE,
+    lon                     DOUBLE,
+    heading                 DOUBLE,
+    raw_json                TEXT
+);
+
+CREATE SEQUENCE IF NOT EXISTS train_v2_gtfsrt_trip_update_seq;
+CREATE TABLE IF NOT EXISTS train_v2_gtfsrt_trip_update (
+    trip_update_id          BIGINT PRIMARY KEY DEFAULT nextval('train_v2_gtfsrt_trip_update_seq'),
+    poll_id                 BIGINT NOT NULL,
+    run_id                  TEXT NOT NULL,
+    local_response_end_ms   BIGINT NOT NULL,
+    route_id                TEXT,
+    trip_id                 TEXT,
+    vehicle_id              TEXT,
+    stop_id                 TEXT,
+    stop_sequence           INTEGER,
+    arrival_time_ms         BIGINT,
+    arrival_delay_seconds   INTEGER,
+    departure_time_ms       BIGINT,
+    departure_delay_seconds INTEGER,
+    schedule_relationship   TEXT
+);
+
+CREATE SEQUENCE IF NOT EXISTS train_v2_gtfsrt_vehicle_position_seq;
+CREATE TABLE IF NOT EXISTS train_v2_gtfsrt_vehicle_position (
+    vehicle_position_id     BIGINT PRIMARY KEY DEFAULT nextval('train_v2_gtfsrt_vehicle_position_seq'),
+    poll_id                 BIGINT NOT NULL,
+    run_id                  TEXT NOT NULL,
+    local_response_end_ms   BIGINT NOT NULL,
+    route_id                TEXT,
+    trip_id                 TEXT,
+    vehicle_id              TEXT,
+    vehicle_label           TEXT,
+    lat                     DOUBLE,
+    lon                     DOUBLE,
+    bearing                 DOUBLE,
+    speed_mps               DOUBLE,
+    current_stop_sequence   INTEGER,
+    current_status          TEXT,
+    congestion_level        TEXT,
+    occupancy_status        TEXT
+);
+
+CREATE SEQUENCE IF NOT EXISTS train_v2_arrival_event_seq;
+CREATE TABLE IF NOT EXISTS train_v2_arrival_event (
+    event_id                BIGINT PRIMARY KEY DEFAULT nextval('train_v2_arrival_event_seq'),
+    run_id                  TEXT NOT NULL,
+    map_id                  TEXT NOT NULL,
+    line                    TEXT,
+    direction_code          TEXT,
+    run_number              TEXT,
+    destination_name        TEXT,
+    actual_arrival_ms       BIGINT,
+    label                   TEXT NOT NULL,
+    high_confidence         BOOLEAN NOT NULL DEFAULT FALSE,
+    confidence              DOUBLE NOT NULL DEFAULT 0,
+    evidence_json           TEXT NOT NULL,
+    reason_codes_json       TEXT NOT NULL,
+    before_position_obs_id  BIGINT,                          -- position row where train was "incoming to" map_id
+    after_position_obs_id   BIGINT,                          -- position row where nextStaId had advanced past map_id
+    gtfsrt_corroboration_id BIGINT,                          -- optional: the GTFS-RT vehicle position that confirmed
+    created_at_ms           BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS train_v2_line_topology (
+    line                    TEXT NOT NULL,
+    direction_code          TEXT NOT NULL,
+    seq                     INTEGER NOT NULL,                -- 0 .. N-1 along the direction of travel
+    map_id                  TEXT NOT NULL,
+    station_name            TEXT,
+    lat                     DOUBLE,
+    lon                     DOUBLE,
+    PRIMARY KEY (line, direction_code, seq)
+);
+
+CREATE TABLE IF NOT EXISTS train_v2_slow_zone (
+    slow_zone_id            TEXT PRIMARY KEY,                -- usually CTA's id field or a hash if missing
+    line                    TEXT NOT NULL,
+    direction_code          TEXT,
+    from_station            TEXT,
+    to_station              TEXT,
+    max_mph                 DOUBLE,
+    posted_at_ms            BIGINT,
+    expected_clear_at_ms    BIGINT,
+    description             TEXT,
+    raw_payload_json        TEXT,
+    first_seen_poll_id      BIGINT,
+    last_seen_poll_id       BIGINT
+);
+
+CREATE SEQUENCE IF NOT EXISTS train_v2_online_estimate_seq;
+CREATE TABLE IF NOT EXISTS train_v2_online_estimate (
+    estimate_id             BIGINT PRIMARY KEY DEFAULT nextval('train_v2_online_estimate_seq'),
+    run_id                  TEXT,
+    generated_at_ms         BIGINT NOT NULL,
+    map_id                  TEXT NOT NULL,
+    line                    TEXT,
+    direction_code          TEXT,
+    run_number              TEXT,
+    predicted_arrival_ms    BIGINT,
+    interval80_low_ms       BIGINT,
+    interval80_high_ms      BIGINT,
+    interval90_low_ms       BIGINT,
+    interval90_high_ms      BIGINT,
+    interval95_low_ms       BIGINT,
+    interval95_high_ms      BIGINT,
+    reliability             DOUBLE NOT NULL,
+    display_state           TEXT NOT NULL,
+    data_quality            TEXT NOT NULL,
+    rider_message           TEXT,
+    reason_codes_json       TEXT NOT NULL,
+    features_json           TEXT NOT NULL,
+    raw_estimate_json       TEXT NOT NULL
+);
+
+CREATE SEQUENCE IF NOT EXISTS train_v2_residual_quantile_seq;
+CREATE TABLE IF NOT EXISTS train_v2_residual_quantile (
+    cal_id          BIGINT PRIMARY KEY DEFAULT nextval('train_v2_residual_quantile_seq'),
+    created_at_ms   BIGINT NOT NULL,
+    line            TEXT,
+    map_id          TEXT,
+    direction_code  TEXT,
+    horizon_bin     TEXT NOT NULL,
+    quality_bin     TEXT NOT NULL,
+    n               INTEGER NOT NULL,
+    q05_s           DOUBLE,
+    q10_s           DOUBLE,
+    q25_s           DOUBLE,
+    q50_s           DOUBLE,
+    q75_s           DOUBLE,
+    q90_s           DOUBLE,
+    q95_s           DOUBLE,
+    mae_s           DOUBLE,
+    bias_s          DOUBLE
+);
+
+CREATE SEQUENCE IF NOT EXISTS train_v2_reliability_bin_seq;
+CREATE TABLE IF NOT EXISTS train_v2_reliability_bin (
+    bin_id                          BIGINT PRIMARY KEY DEFAULT nextval('train_v2_reliability_bin_seq'),
+    created_at_ms                   BIGINT NOT NULL,
+    run_id                          TEXT,
+    lower_bound                     DOUBLE NOT NULL,
+    upper_bound                     DOUBLE NOT NULL,
+    n                               INTEGER NOT NULL,
+    mean_predicted_reliability      DOUBLE,
+    empirical_success_rate          DOUBLE,
+    brier                           DOUBLE,
+    ece_component                   DOUBLE
+);
+
+CREATE INDEX IF NOT EXISTS idx_train_v2_api_poll_run_endpoint
+    ON train_v2_api_poll(run_id, source, endpoint, local_request_start_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_api_poll_time
+    ON train_v2_api_poll(local_request_start_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_arrival_obs_station_time
+    ON train_v2_arrival_observation(map_id, line, direction_code, local_response_end_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_arrival_obs_run
+    ON train_v2_arrival_observation(run_number, map_id, local_response_end_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_follow_obs_run_time
+    ON train_v2_follow_observation(run_number, local_response_end_ms, seq);
+CREATE INDEX IF NOT EXISTS idx_train_v2_follow_obs_station
+    ON train_v2_follow_observation(map_id, line, local_response_end_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_position_obs_run_time
+    ON train_v2_position_observation(run_number, line, local_response_end_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_position_obs_next
+    ON train_v2_position_observation(next_station_map_id, line, local_response_end_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_gtfsrt_trip_route
+    ON train_v2_gtfsrt_trip_update(route_id, stop_id, arrival_time_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_gtfsrt_trip_vehicle
+    ON train_v2_gtfsrt_trip_update(vehicle_id, stop_id, arrival_time_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_gtfsrt_pos_vehicle_time
+    ON train_v2_gtfsrt_vehicle_position(vehicle_id, local_response_end_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_arrival_event_lookup
+    ON train_v2_arrival_event(run_id, map_id, line, direction_code, actual_arrival_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_arrival_event_high_conf
+    ON train_v2_arrival_event(high_confidence, label);
+CREATE INDEX IF NOT EXISTS idx_train_v2_topology_lookup
+    ON train_v2_line_topology(line, direction_code, map_id);
+CREATE INDEX IF NOT EXISTS idx_train_v2_online_estimate_lookup
+    ON train_v2_online_estimate(map_id, line, generated_at_ms);
+CREATE INDEX IF NOT EXISTS idx_train_v2_residual_quantile_lookup
+    ON train_v2_residual_quantile(line, map_id, direction_code, horizon_bin, quality_bin, created_at_ms);
 """
 
 

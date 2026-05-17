@@ -240,6 +240,23 @@ def _endpoint_signal(
 
     if f.mode == "L":
         map_id = f.boarding_map_id if side == "boarding" else f.alighting_map_id
+        # If the train_v2 pipeline has a high-confidence nextStaId
+        # transition for this station within ±60 s of the endpoint, treat
+        # it as gold-standard ground truth and saturate the signal.
+        hc_lo_ms = int((ts - timedelta(seconds=60)).timestamp() * 1000)
+        hc_hi_ms = int((ts + timedelta(seconds=60)).timestamp() * 1000)
+        hc = conn.execute(
+            """
+            SELECT COUNT(*) FROM train_v2_arrival_event
+             WHERE map_id = ? AND line = ?
+               AND high_confidence = TRUE
+               AND actual_arrival_ms BETWEEN ? AND ?
+            """,
+            [str(map_id), f.line, hc_lo_ms, hc_hi_ms],
+        ).fetchone()
+        if hc and (hc[0] or 0) > 0:
+            return float(_TRUTH_SCORE_CAP)
+
         rows = conn.execute(
             """
             SELECT COUNT(*) FILTER (WHERE is_approaching = TRUE),

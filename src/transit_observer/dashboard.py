@@ -407,6 +407,133 @@ def _bus_v3_residual_df() -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=30)
+def _train_v2_status_df() -> pd.DataFrame:
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        if not _table_exists(conn, "train_v2_api_poll"):
+            return pd.DataFrame()
+        rows = conn.execute(
+            """
+            SELECT source, endpoint, COUNT(*) AS polls,
+                   SUM(CASE WHEN ok THEN 1 ELSE 0 END) AS ok_polls,
+                   MAX(local_response_end_ms) AS last_response_ms
+              FROM train_v2_api_poll
+             GROUP BY source, endpoint
+             ORDER BY source, endpoint
+            """
+        ).fetchall()
+    return pd.DataFrame(
+        [
+            {"source": s, "endpoint": e, "polls": int(p), "ok_polls": int(o or 0),
+             "last_response_ms": int(l or 0)}
+            for s, e, p, o, l in rows
+        ]
+    )
+
+
+@st.cache_data(ttl=30)
+def _train_v2_arrival_label_df() -> pd.DataFrame:
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        if not _table_exists(conn, "train_v2_arrival_event"):
+            return pd.DataFrame()
+        rows = conn.execute(
+            """
+            SELECT label,
+                   SUM(CASE WHEN high_confidence THEN 1 ELSE 0 END) AS high_conf,
+                   COUNT(*) AS total
+              FROM train_v2_arrival_event
+             GROUP BY label
+             ORDER BY label
+            """
+        ).fetchall()
+    return pd.DataFrame(
+        [{"label": l, "high_confidence": int(h or 0), "total": int(t or 0)} for l, h, t in rows]
+    )
+
+
+@st.cache_data(ttl=30)
+def _train_v2_residual_df() -> pd.DataFrame:
+    if not _db_ready():
+        return pd.DataFrame()
+    with db.reader() as conn:
+        if not _table_exists(conn, "train_v2_residual_quantile"):
+            return pd.DataFrame()
+        rows = conn.execute(
+            """
+            SELECT line, map_id, direction_code, horizon_bin, quality_bin, n,
+                   q10_s, q50_s, q90_s, mae_s, bias_s
+              FROM train_v2_residual_quantile
+             ORDER BY created_at_ms DESC, line, map_id, direction_code
+             LIMIT 200
+            """
+        ).fetchall()
+    return pd.DataFrame(
+        [
+            {
+                "line": line, "map_id": mid, "direction": dir_c,
+                "horizon_bin": hbin, "quality_bin": qbin, "n": int(n),
+                "q10_s": q10, "q50_s": q50, "q90_s": q90,
+                "mae_s": mae, "bias_s": bias,
+            }
+            for line, mid, dir_c, hbin, qbin, n, q10, q50, q90, mae, bias in rows
+        ]
+    )
+
+
+def _render_train_v2_tab() -> None:
+    """Read-only summary of the CTA L (train) v2 pipeline."""
+    st.subheader("CTA L (train) v2 pipeline")
+    st.caption(
+        "Parallel to the legacy ttarrivals path. Pulls ttarrivals + "
+        "ttfollow + ttpositions + CTA GTFS-RT for cross-stream "
+        "validation. ``train-telemetry-v1`` is the predictor that "
+        "consumes it via the registry."
+    )
+    if _db_ready():
+        with db.reader() as conn:
+            schema_present = _table_exists(conn, "train_v2_api_poll")
+    else:
+        schema_present = False
+    if not schema_present:
+        st.info(
+            "Train v2 tables not present in the read replica yet. "
+            "Start the collector — it will create the new tables on its "
+            "next ``init_schema`` call."
+        )
+        return
+    status = _train_v2_status_df()
+    if status.empty:
+        st.info(
+            "No v2 polls yet. Confirm ``train_v2_enabled`` is on and "
+            "``CTA_TRAIN_API_KEY`` is set."
+        )
+        return
+    st.markdown("**Ingest counts (per source, endpoint)**")
+    st.dataframe(status, use_container_width=True, hide_index=True)
+    arrivals = _train_v2_arrival_label_df()
+    if not arrivals.empty:
+        st.markdown("**Arrival events by label**")
+        st.dataframe(arrivals, use_container_width=True, hide_index=True)
+        st.caption(
+            "``ARRIVED_CONFIRMED`` rows feed accuracy metrics. The "
+            "others are diagnostic — ``REROUTED_OR_SHORT_TURN``, "
+            "``FAULTED_TRACKING``, ``STALE_DATA``, ``CENSORED_UNKNOWN``."
+        )
+    residuals = _train_v2_residual_df()
+    if not residuals.empty:
+        st.markdown("**Residual calibration (latest 200 cells)**")
+        st.dataframe(residuals, use_container_width=True, hide_index=True)
+        st.caption(
+            "Empirical residual seconds (actual − predicted) per "
+            "``(line, map_id, direction, horizon_bin, quality_bin)``. "
+            "Run ``transit train-v2 calibrate`` to refresh."
+        )
+
+
 def _render_bus_v3_tab() -> None:
     """Read-only summary of the CTA Bus Tracker v3 pipeline."""
     st.subheader("CTA Bus Tracker v3 pipeline")
@@ -848,6 +975,7 @@ def _render() -> None:
         "Sharpness ↔ coverage",
         "Live forecast",
         "Bus v3 telemetry",
+        "Train v2 telemetry",
     ])
     with tabs[0]:
         view = st.radio(
@@ -959,6 +1087,8 @@ def _render() -> None:
         _render_live_forecast_tab()
     with tabs[5]:
         _render_bus_v3_tab()
+    with tabs[6]:
+        _render_train_v2_tab()
 
     st.divider()
     _render_predictors_section()
