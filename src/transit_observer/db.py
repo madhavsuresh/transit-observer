@@ -1510,6 +1510,12 @@ _MIGRATIONS: tuple[tuple[str, str, str, str | None], ...] = (
     ("train_v2_gtfsrt_vehicle_position", "trip_schedule_relationship", "TEXT",    None),
     ("train_v2_gtfsrt_vehicle_position", "vehicle_license_plate",      "TEXT",    None),
     ("train_v2_gtfsrt_vehicle_position", "odometer_m",                 "DOUBLE",  None),
+    # Tier-2 data-capture widening: AirNow per-pollutant enrichment.
+    ("air_quality_raw", "category_number", "INTEGER", None),
+    ("air_quality_raw", "state_code",      "TEXT",    None),
+    ("air_quality_raw", "is_forecast",     "BOOLEAN", "FALSE"),
+    ("air_quality_raw", "forecast_date",   "TEXT",    None),
+    ("air_quality_raw", "action_day",      "BOOLEAN", None),
 )
 
 
