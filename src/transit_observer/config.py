@@ -61,6 +61,13 @@ class Settings:
     train_v2_follow_max_runs_per_cycle: int = 6     # cap ttfollow calls per cycle for budget safety
     train_v2_gtfsrt_interval_seconds: float = 60.0  # GTFS-RT independent cadence
     train_v2_topology_refresh_seconds: float = 86400.0  # daily rebuild from positions log
+    # Platform-level (ttarrivals.aspx?stpid=...) polling. Strictly more
+    # data than the station-level path at multi-platform stations
+    # (separate per-direction prediction caps). Off by default — flip
+    # on once your daily request budget allows it.
+    train_v2_platform_polling_enabled: bool = False
+    train_v2_platforms_per_cycle: int = 4
+    train_v2_platform_max_predictions: int = 8
     weather_poll_interval_seconds: float = 900.0          # 15 min × a few sites
     air_quality_poll_interval_seconds: float = 3600.0     # hourly
     social_poll_interval_seconds: float = 600.0           # 10 min, polite to Mastodon/Bluesky

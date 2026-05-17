@@ -44,6 +44,7 @@ from .train_v2.normalize import (
     normalize_gtfsrt_trip_updates,
     normalize_gtfsrt_vehicle_positions,
 )
+from .train_v2.slow_zone_parser import parse_slow_zones
 from .train_v2.models import ApiCallResult as TrainV2ApiCallResult
 from .train_v2.util import now_ms as _train_v2_now_ms
 from .catalog import LStation, load_catalog
@@ -283,6 +284,7 @@ async def run(stngs: Settings = settings) -> None:
                             arrivals=train_summary.arrivals_polled,
                             positions=train_summary.positions_polled,
                             follow=train_summary.follow_polled,
+                            platforms=train_summary.platforms_polled,
                             run_numbers=len(train_summary.run_numbers),
                         )
                     if train_summary.run_id and train_summary.positions_polled:
@@ -372,6 +374,17 @@ async def run(stngs: Settings = settings) -> None:
                     )
                     if n_sz:
                         log.info("slow_zones.snapshot", n=n_sz)
+                        # Parse the freshly-captured HTML into structured
+                        # rows. Failures are logged but never abort the
+                        # loop — the raw body is preserved in
+                        # api_payloads_raw for retrospective re-parsing.
+                        try:
+                            n_sz_parsed = parse_slow_zones(conn)
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("slow_zones.parse_failed", err=str(exc))
+                            n_sz_parsed = 0
+                        if n_sz_parsed:
+                            log.info("slow_zones.parsed", rows=n_sz_parsed)
                     last_slow_zone_poll = tick_started
 
                 if (
@@ -729,6 +742,9 @@ async def _run_train_v2_cycle(
         arrivals_batch_size=stngs.train_v2_arrivals_batch_size,
         arrivals_max_predictions=stngs.train_v2_arrivals_max_predictions,
         follow_max_runs_per_cycle=stngs.train_v2_follow_max_runs_per_cycle,
+        platform_polling_enabled=stngs.train_v2_platform_polling_enabled,
+        platforms_per_cycle=stngs.train_v2_platforms_per_cycle,
+        platform_max_predictions=stngs.train_v2_platform_max_predictions,
     )
     try:
         return await train_v2_collector.poll_once(conn, client, config=config, state=state)
@@ -741,6 +757,7 @@ async def _run_train_v2_cycle(
             arrivals_polled=0,
             positions_polled=0,
             follow_polled=0,
+            platforms_polled=0,
             run_numbers=[],
             polls_recorded=0,
         )
@@ -975,20 +992,31 @@ async def _poll_aqi(
     *,
     zips: tuple[str, ...],
 ) -> int:
-    """Snapshot current AQI for each configured zip code (AirNow)."""
+    """Snapshot current AQI + tomorrow's forecast for each configured
+    zip (AirNow). Each row distinguishes observation vs forecast via
+    ``is_forecast``; per-pollutant rows carry ``category_number`` (the
+    actionable 1-6 AQI category) and ``state_code``.
+    """
     polled_at = datetime.now(CHICAGO)
     rows: list[tuple] = []
     for zip_code in zips:
         try:
-            obs_list = await client.fetch_zip(zip_code)
+            current = await client.fetch_zip(zip_code)
         except Exception as exc:  # noqa: BLE001
             log.warning("aqi.error", zip=zip_code, err=str(exc))
-            continue
-        for obs in obs_list:
+            current = []
+        try:
+            forecast = await client.fetch_zip_forecast(zip_code)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("aqi.forecast_error", zip=zip_code, err=str(exc))
+            forecast = []
+        for obs in (*current, *forecast):
             rows.append((
                 polled_at, obs.site_id, obs.parameter, obs.aqi, obs.raw_value, obs.unit,
                 obs.category, obs.observation_time, obs.reporting_area,
                 obs.latitude, obs.longitude,
+                obs.category_number, obs.state_code,
+                obs.is_forecast, obs.forecast_date, obs.action_day,
             ))
     if not rows:
         return 0
@@ -996,8 +1024,9 @@ async def _poll_aqi(
         """
         INSERT INTO air_quality_raw (
             polled_at, site_id, parameter, aqi, raw_value, unit,
-            category, observation_time, reporting_area, latitude, longitude
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            category, observation_time, reporting_area, latitude, longitude,
+            category_number, state_code, is_forecast, forecast_date, action_day
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )

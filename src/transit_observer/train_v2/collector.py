@@ -39,6 +39,11 @@ class TrainV2CycleConfig:
     arrivals_max_predictions: int = 12     # ``max`` param per ttarrivals call
     follow_max_runs_per_cycle: int = 6     # cap on ttfollow calls per cycle
     rotation: Optional[itertools.cycle] = None
+    # Platform-level (ttarrivals.aspx?stpid=...) polling. Off by default;
+    # the host (transit_observer.collector) sets these from settings.
+    platform_polling_enabled: bool = False
+    platforms_per_cycle: int = 4
+    platform_max_predictions: int = 8
 
 
 @dataclass
@@ -59,6 +64,7 @@ class TrainV2CycleResult:
     arrivals_polled: int
     positions_polled: int
     follow_polled: int
+    platforms_polled: int
     run_numbers: list[str]
     polls_recorded: int
 
@@ -126,6 +132,42 @@ async def poll_once(
                     if rn:
                         run_numbers.add(str(rn))
 
+    # Platform-level ttarrivals (by stpId). Strictly more data at
+    # multi-platform stations; opt-in to keep the budget safe. The
+    # round-robin picks the platforms whose last poll is oldest.
+    platforms_polled = 0
+    if config.platform_polling_enabled and config.platforms_per_cycle > 0:
+        platform_rows = conn.execute(
+            f"""
+            SELECT map_id, stop_id, MAX(local_response_end_ms) AS last_polled_ms
+              FROM train_v2_arrival_observation
+             WHERE stop_id IS NOT NULL AND map_id IS NOT NULL
+             GROUP BY map_id, stop_id
+             ORDER BY last_polled_ms ASC NULLS FIRST
+             LIMIT {int(config.platforms_per_cycle)}
+            """
+        ).fetchall()
+        for _map_id, stop_id, _last_ms in platform_rows:
+            if not stop_id:
+                continue
+            try:
+                result = await client.ttarrivals_by_stop(
+                    stop_id=int(stop_id),
+                    max_predictions=config.platform_max_predictions,
+                )
+            except (ValueError, TypeError):
+                continue
+            record_poll(conn, result, run_id=run_id, cycle_index=cycle_index)
+            polls_recorded += 1
+            platforms_polled += 1
+            if result.cta_server_time_ms is not None:
+                server_ms_seen.append(result.cta_server_time_ms)
+            if result.json_data:
+                for eta in (result.json_data.get("ctatt") or {}).get("eta") or []:
+                    rn = eta.get("rn") if isinstance(eta, dict) else None
+                    if rn:
+                        run_numbers.add(str(rn))
+
     # 3. ttfollow for a deduped subset of runs (cap to budget).
     # Prefer runs we haven't followed in the previous cycle so coverage
     # rotates.
@@ -153,6 +195,7 @@ async def poll_once(
         arrivals_polled=arrivals_polled,
         positions_polled=positions_polled,
         follow_polled=follow_polled,
+        platforms_polled=platforms_polled,
         run_numbers=sorted(run_numbers),
         polls_recorded=polls_recorded,
     )
