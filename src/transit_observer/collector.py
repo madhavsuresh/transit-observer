@@ -34,6 +34,17 @@ from .bus_v3 import catalog as bus_v3_catalog
 from .bus_v3 import collector as bus_v3_collector
 from .bus_v3.client import CTABusV3Client
 from .bus_v3.inference import infer_bus_arrivals
+from .train_v2 import catalog as train_v2_catalog
+from .train_v2 import collector as train_v2_collector
+from .train_v2.client import CTATrainV2Client
+from .train_v2.inference import infer_train_arrivals
+from .train_v2.normalize import (
+    insert_api_poll as _train_v2_insert_api_poll,
+    normalize_gtfsrt_trip_updates,
+    normalize_gtfsrt_vehicle_positions,
+)
+from .train_v2.models import ApiCallResult as TrainV2ApiCallResult
+from .train_v2.util import now_ms as _train_v2_now_ms
 from .catalog import LStation, load_catalog
 from .config import CHICAGO, Settings, settings
 from .corpus import predict_and_enqueue_corridor
@@ -78,6 +89,9 @@ async def run(stngs: Settings = settings) -> None:
     last_bus_avl_poll = datetime.now(CHICAGO) - timedelta(seconds=stngs.bus_avl_poll_interval_seconds)
     last_bus_v3_poll = datetime.now(CHICAGO) - timedelta(seconds=stngs.bus_v3_interval_seconds)
     bus_v3_state = bus_v3_collector.BusV3CycleState()
+    last_train_v2_poll = datetime.now(CHICAGO) - timedelta(seconds=stngs.train_v2_interval_seconds)
+    last_train_v2_gtfsrt_poll = datetime.now(CHICAGO) - timedelta(seconds=stngs.train_v2_gtfsrt_interval_seconds)
+    train_v2_state = train_v2_collector.TrainV2CycleState()
     last_metra_poll = datetime.now(CHICAGO)
     last_intercampus_poll = datetime.now(CHICAGO)
     last_query_import = datetime.now(CHICAGO)
@@ -119,6 +133,11 @@ async def run(stngs: Settings = settings) -> None:
         bus_v3_client = (
             CTABusV3Client(stngs.cta_bus_api_key)
             if stngs.cta_bus_api_key and stngs.bus_v3_enabled
+            else None
+        )
+        train_v2_client = (
+            CTATrainV2Client(stngs.cta_train_api_key)
+            if stngs.train_v2_enabled
             else None
         )
         metra_client = (
@@ -244,6 +263,60 @@ async def run(stngs: Settings = settings) -> None:
                                 run=cycle_summary.run_id,
                                 events=n_inferred,
                             )
+
+                # Train v2 parallel pipeline. Independent cadence;
+                # ttarrivals + ttpositions + ttfollow share one cycle.
+                if (
+                    train_v2_client
+                    and (tick_started - last_train_v2_poll).total_seconds() >= stngs.train_v2_interval_seconds
+                ):
+                    train_summary = await _run_train_v2_cycle(
+                        conn, train_v2_client, stngs=stngs, state=train_v2_state,
+                    )
+                    last_train_v2_poll = tick_started
+                    if train_summary.polls_recorded:
+                        log.info(
+                            "train_v2.polled",
+                            run=train_summary.run_id,
+                            polls=train_summary.polls_recorded,
+                            arrivals=train_summary.arrivals_polled,
+                            positions=train_summary.positions_polled,
+                            follow=train_summary.follow_polled,
+                            run_numbers=len(train_summary.run_numbers),
+                        )
+                    if train_summary.run_id and train_summary.positions_polled:
+                        try:
+                            n_inferred = infer_train_arrivals(
+                                conn, run_id=train_summary.run_id, replace=False,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("train_v2.inference_failed", err=str(exc))
+                            n_inferred = 0
+                        if n_inferred:
+                            log.info(
+                                "train_v2.arrivals_inferred",
+                                run=train_summary.run_id,
+                                events=n_inferred,
+                            )
+
+                # GTFS-RT train feeds on a slower cadence. Reuses the
+                # existing CTAGtfsRtClient + monkey-patched normalizer
+                # so we land in the train_v2_gtfsrt_* tables.
+                if (
+                    train_v2_client
+                    and stngs.cta_gtfsrt_feeds
+                    and (tick_started - last_train_v2_gtfsrt_poll).total_seconds() >= stngs.train_v2_gtfsrt_interval_seconds
+                ):
+                    n_tu, n_vp = await _run_train_v2_gtfsrt(
+                        conn,
+                        cta_gtfsrt_client,
+                        feeds=stngs.cta_gtfsrt_feeds,
+                        run_id=train_v2_state.last_run_id or "trainv2_gtfsrt",
+                        cycle_index=train_v2_state.cycle_index,
+                    )
+                    last_train_v2_gtfsrt_poll = tick_started
+                    if n_tu or n_vp:
+                        log.info("train_v2.gtfsrt_polled", trip_updates=n_tu, vehicle_positions=n_vp)
 
                 if metra_client and (tick_started - last_metra_poll).total_seconds() >= stngs.metra_poll_interval_seconds:
                     n_metra = await _poll_metra(conn, metra_client)
@@ -446,6 +519,8 @@ async def run(stngs: Settings = settings) -> None:
                 await bus_client.aclose()
             if bus_v3_client:
                 await bus_v3_client.aclose()
+            if train_v2_client:
+                await train_v2_client.aclose()
             if metra_client:
                 await metra_client.aclose()
             await intercampus_client.aclose()
@@ -628,6 +703,108 @@ async def _run_bus_v3_cycle(
             near_arrival=False,
             polls_recorded=0,
         )
+
+
+async def _run_train_v2_cycle(
+    conn: duckdb.DuckDBPyConnection,
+    client: CTATrainV2Client,
+    *,
+    stngs: Settings,
+    state: train_v2_collector.TrainV2CycleState,
+) -> train_v2_collector.TrainV2CycleResult:
+    """One v2 train cycle: round-robin ttarrivals + ttpositions + ttfollow.
+
+    All writes go to ``train_v2_*`` tables — legacy ``train_arrivals_raw``
+    is untouched. The function defends against transient failures so the
+    main loop never dies on a v2 hiccup.
+    """
+    targets = train_v2_catalog.all_stations()
+    config = train_v2_collector.TrainV2CycleConfig(
+        targets=targets,
+        line_codes=stngs.line_codes,
+        arrivals_batch_size=stngs.train_v2_arrivals_batch_size,
+        arrivals_max_predictions=stngs.train_v2_arrivals_max_predictions,
+        follow_max_runs_per_cycle=stngs.train_v2_follow_max_runs_per_cycle,
+    )
+    try:
+        return await train_v2_collector.poll_once(conn, client, config=config, state=state)
+    except Exception as exc:  # noqa: BLE001 — never let the v2 path kill the loop
+        log.warning("train_v2.cycle_failed", err=str(exc))
+        return train_v2_collector.TrainV2CycleResult(
+            run_id=state.last_run_id or "",
+            cycle_index=state.cycle_index,
+            server_ms=None,
+            arrivals_polled=0,
+            positions_polled=0,
+            follow_polled=0,
+            run_numbers=[],
+            polls_recorded=0,
+        )
+
+
+async def _run_train_v2_gtfsrt(
+    conn: duckdb.DuckDBPyConnection,
+    client: CTAGtfsRtClient,
+    *,
+    feeds: tuple[tuple[str, str, str], ...],
+    run_id: str,
+    cycle_index: int,
+) -> tuple[int, int]:
+    """Poll configured CTA GTFS-RT train feeds and normalize into the
+    ``train_v2_gtfsrt_*`` tables.
+
+    Settings store feeds as ``(mode, kind, url)`` tuples; we only
+    consume ``mode='train'``. Each successful poll writes a row to
+    ``train_v2_api_poll`` plus the normalized trip-update or
+    vehicle-position rows.
+    """
+    n_tu = 0
+    n_vp = 0
+    for mode, kind, url in feeds:
+        if mode != "train":
+            continue
+        start = _train_v2_now_ms()
+        try:
+            if kind == "trip_updates":
+                rows = await client.fetch_trip_updates(url=url, mode="train")
+            elif kind == "vehicle_positions":
+                rows = await client.fetch_vehicle_positions(url=url, mode="train")
+            else:
+                continue
+            ok = True
+            err = None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("train_v2.gtfsrt_fetch_failed", url=url, kind=kind, err=str(exc))
+            rows = []
+            ok = False
+            err = str(exc)
+        end = _train_v2_now_ms()
+        result = TrainV2ApiCallResult(
+            endpoint="gtfsrt",
+            source="gtfsrt_train",
+            params_redacted={"kind": kind},
+            query_kind=kind,
+            request_url_redacted=url,
+            local_request_start_ms=start,
+            local_response_end_ms=end,
+            cta_server_time_ms=None,
+            http_status=200 if ok else None,
+            latency_ms=float(end - start),
+            ok=ok,
+            json_data=None,
+            raw_bytes=None,
+            error_message=err,
+        )
+        poll_id = _train_v2_insert_api_poll(conn, result, run_id=run_id, cycle_index=cycle_index)
+        if kind == "trip_updates":
+            n_tu += normalize_gtfsrt_trip_updates(
+                conn, poll_id, run_id, rows, local_response_end_ms=end,
+            )
+        elif kind == "vehicle_positions":
+            n_vp += normalize_gtfsrt_vehicle_positions(
+                conn, poll_id, run_id, rows, local_response_end_ms=end,
+            )
+    return n_tu, n_vp
 
 
 async def _poll_metra(
