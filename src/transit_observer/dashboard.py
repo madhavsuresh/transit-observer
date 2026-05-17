@@ -51,6 +51,22 @@ def _db_ready() -> bool:
     return settings.db_path.exists() or settings.read_replica_path.exists()
 
 
+def _table_exists(conn, name: str) -> bool:
+    """True iff ``name`` exists in the currently-attached DuckDB.
+
+    Used by the dashboard's bus_v3 helpers because the read replica may
+    have been copied from a DB that was created before the v3 schema
+    additions landed. The collector creates the new tables on its next
+    ``init_schema`` call, but until the replica refreshes the dashboard
+    can hit a missing-table catalog error.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = ? LIMIT 1",
+        [name],
+    ).fetchone()
+    return row is not None
+
+
 @st.cache_data(ttl=30)
 def _status_dict() -> dict:
     if not _db_ready():
@@ -317,6 +333,8 @@ def _bus_v3_status_df() -> pd.DataFrame:
     if not _db_ready():
         return pd.DataFrame()
     with db.reader() as conn:
+        if not _table_exists(conn, "bus_v3_api_poll"):
+            return pd.DataFrame()
         rows = conn.execute(
             """
             SELECT endpoint,
@@ -342,6 +360,8 @@ def _bus_v3_arrival_label_df() -> pd.DataFrame:
     if not _db_ready():
         return pd.DataFrame()
     with db.reader() as conn:
+        if not _table_exists(conn, "bus_v3_arrival_event"):
+            return pd.DataFrame()
         rows = conn.execute(
             """
             SELECT label,
@@ -363,6 +383,8 @@ def _bus_v3_residual_df() -> pd.DataFrame:
     if not _db_ready():
         return pd.DataFrame()
     with db.reader() as conn:
+        if not _table_exists(conn, "bus_v3_residual_quantile"):
+            return pd.DataFrame()
         rows = conn.execute(
             """
             SELECT rt, stpid, rtdir, horizon_bin, quality_bin, n,
@@ -393,6 +415,23 @@ def _render_bus_v3_tab() -> None:
         "high-confidence ground truth; ``bus-telemetry-v1`` is the "
         "predictor that consumes it via the registry."
     )
+    # Distinguish "tables exist but empty" from "tables don't exist yet".
+    # The latter happens right after merging the v3 PR, before the
+    # collector has run ``init_schema`` (which creates the new tables)
+    # and before the read replica has been refreshed.
+    if _db_ready():
+        with db.reader() as conn:
+            schema_present = _table_exists(conn, "bus_v3_api_poll")
+    else:
+        schema_present = False
+    if not schema_present:
+        st.info(
+            "Bus v3 tables not present in the read replica yet. Start "
+            "the collector — it will create the new tables on its next "
+            "``init_schema`` call and refresh the read replica on its "
+            "normal cadence."
+        )
+        return
     status = _bus_v3_status_df()
     if status.empty:
         st.info(
